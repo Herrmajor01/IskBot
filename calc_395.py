@@ -1,9 +1,10 @@
-import requests
-from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
-from docx import Document
 import logging
 import re
+from datetime import datetime, timedelta
+
+import requests
+from bs4 import BeautifulSoup
+from docx import Document
 
 logging.basicConfig(level=logging.INFO, filename='bot.log',
                     format='%(asctime)s - %(levelname)s - %(message)s')
@@ -98,29 +99,56 @@ def parse_periods_from_docx(docx_path):
                 f"Некорректная строка таблицы: {len(cells)} столбцов")
             continue
         try:
+            # Парсинг суммы
             amount_text = cells[0].text.strip()
-            if 'р.' in amount_text:
-                amount_text = amount_text.replace(
-                    'р.', '').replace(' ', '').replace(',', '.')
-                if amount_text.startswith('+'):
-                    amount = float(amount_text[1:])
-                    current_sum += amount
-                else:
-                    current_sum = float(amount_text)
-            else:
+            if not amount_text:
                 continue
 
+            # Очистка текста суммы
+            amount_text = re.sub(r'[^\d.,+\-]', '', amount_text)
+            if not amount_text:
+                continue
+
+            if amount_text.startswith('+'):
+                amount = float(amount_text[1:].replace(',', '.'))
+                current_sum += amount
+            else:
+                current_sum = float(amount_text.replace(',', '.'))
+
+            # Парсинг дат
             date_from_text = cells[1].text.strip()
             date_to_text = cells[2].text.strip()
+            if not date_from_text or not date_to_text:
+                continue
+
             if date_to_text.lower() == "новая задолженность":
+                continue
+
+            # Проверка формата дат
+            if not re.match(r'\d{2}\.\d{2}\.\d{4}', date_from_text) or not re.match(r'\d{2}\.\d{2}\.\d{4}', date_to_text):
                 continue
 
             date_from = datetime.strptime(date_from_text, '%d.%m.%Y')
             date_to = datetime.strptime(date_to_text, '%d.%m.%Y')
-            days = int(cells[3].text.strip())
-            rate = float(cells[4].text.replace(',', '.'))
-            interest = float(cells[6].text.replace(
-                'р.', '').replace(' ', '').replace(',', '.'))
+
+            # Парсинг дней
+            days_text = cells[3].text.strip()
+            if not days_text or not days_text.isdigit():
+                continue
+            days = int(days_text)
+
+            # Парсинг ставки
+            rate_text = cells[4].text.strip()
+            if not rate_text:
+                continue
+            rate = float(rate_text.replace(',', '.'))
+
+            # Парсинг процентов
+            interest_text = cells[6].text.strip()
+            if not interest_text:
+                continue
+            interest_text = re.sub(r'[^\d.,]', '', interest_text)
+            interest = float(interest_text.replace(',', '.'))
 
             periods.append({
                 'sum': current_sum,
@@ -129,7 +157,7 @@ def parse_periods_from_docx(docx_path):
                 'days': days,
                 'rate': rate,
                 'interest': interest,
-                'formula': cells[5].text.strip()
+                'formula': cells[5].text.strip() if len(cells) > 5 else ""
             })
         except Exception as e:
             logging.warning(f"Ошибка парсинга строки: {e}")
@@ -169,16 +197,29 @@ def parse_claim_data(docx_path):
         'address': defendant_match.group(5).strip() if defendant_match else "Не указано"
     }
 
-    # Сумма долга
-    debt_match = re.search(r"Сумма основного долга: ([\d\s,.]+)\s*р.", text)
-    debt = float(debt_match.group(1).replace(
-        ' ', '').replace(',', '.')) if debt_match else 0.0
+    # Сумма долга - более гибкий поиск
+    debt_match = re.search(
+        r"Сумма\s*основного\s*долга\s*:?\s*([\d\s,.]+)\s*р?\.?", text, re.IGNORECASE)
+    if debt_match:
+        try:
+            debt = float(debt_match.group(1).replace(
+                ' ', '').replace(',', '.'))
+        except ValueError:
+            debt = 0.0
+    else:
+        debt = 0.0
 
-    # Юридические услуги
+    # Юридические услуги - более гибкий поиск
     legal_fees_match = re.search(
-        r"юридические услуги.*?([\d\s,.]+)\s*рублей", text)
-    legal_fees = float(legal_fees_match.group(1).replace(
-        ' ', '').replace(',', '.')) if legal_fees_match else 0.0
+        r"юридические\s+услуги.*?([\d\s,.]+)\s*рубл", text, re.IGNORECASE)
+    if legal_fees_match:
+        try:
+            legal_fees = float(legal_fees_match.group(
+                1).replace(' ', '').replace(',', '.'))
+        except ValueError:
+            legal_fees = 0.0
+    else:
+        legal_fees = 0.0
 
     # Договоры
     contracts_match = re.findall(
@@ -241,7 +282,7 @@ def calculate_full_395(docx_path, today=None, key_rates=None):
             'date_from': p['date_from'].strftime('%d.%m.%Y'),
             'date_to': p['date_to'].strftime('%d.%m.%Y'),
             'rate': p['rate'],
-            'days': days,
+            'days': p['days'],
             'interest': round(interest, 2),
             'sum': p['sum'],
             'formula': f"{p['sum']:,.2f} × {p['days']} × {p['rate']}% / {year_days}".replace(',', ' ')
