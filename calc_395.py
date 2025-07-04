@@ -2,7 +2,6 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 from docx import Document
-from docx.shared import Pt
 import logging
 import re
 
@@ -11,53 +10,22 @@ logging.basicConfig(level=logging.INFO, filename='bot.log',
 
 
 def get_key_rates_from_395gk():
-    # Статические данные ставок с сайта https://395gk.ru/svedcb.htm
     rates_data = [
-        ("01.08.2016", "10.50"),
-        ("19.09.2016", "10.00"),
-        ("27.03.2017", "9.75"),
-        ("02.05.2017", "9.25"),
-        ("19.06.2017", "9.00"),
-        ("18.09.2017", "8.50"),
-        ("30.10.2017", "8.25"),
-        ("18.12.2017", "7.75"),
-        ("12.02.2018", "7.50"),
-        ("26.03.2018", "7.25"),
-        ("17.09.2018", "7.50"),
-        ("17.12.2018", "7.75"),
-        ("17.06.2019", "7.50"),
-        ("29.07.2019", "7.25"),
-        ("09.09.2019", "7.00"),
-        ("28.10.2019", "6.50"),
-        ("16.12.2019", "6.25"),
-        ("10.02.2020", "6.00"),
-        ("27.04.2020", "5.50"),
-        ("22.06.2020", "4.50"),
-        ("27.07.2020", "4.25"),
-        ("22.03.2021", "4.50"),
-        ("26.04.2021", "5.00"),
-        ("15.06.2021", "5.50"),
-        ("26.07.2021", "6.50"),
-        ("13.09.2021", "6.75"),
-        ("25.10.2021", "7.50"),
-        ("20.12.2021", "8.50"),
-        ("14.02.2022", "9.50"),
-        ("28.02.2022", "20.00"),
-        ("11.04.2022", "17.00"),
-        ("04.05.2022", "14.00"),
-        ("27.05.2022", "11.00"),
-        ("14.06.2022", "9.50"),
-        ("25.07.2022", "8.00"),
-        ("19.09.2022", "7.50"),
-        ("24.07.2023", "8.50"),
-        ("15.08.2023", "12.00"),
-        ("18.09.2023", "13.00"),
-        ("30.10.2023", "15.00"),
-        ("18.12.2023", "16.00"),
-        ("29.07.2024", "18.00"),
-        ("16.09.2024", "19.00"),
-        ("28.10.2024", "21.00"),
-        ("09.06.2025", "20.00"),
+        ("01.08.2016", "10.50"), ("19.09.2016", "10.00"), ("27.03.2017", "9.75"),
+        ("02.05.2017", "9.25"), ("19.06.2017", "9.00"), ("18.09.2017", "8.50"),
+        ("30.10.2017", "8.25"), ("18.12.2017", "7.75"), ("12.02.2018", "7.50"),
+        ("26.03.2018", "7.25"), ("17.09.2018", "7.50"), ("17.12.2018", "7.75"),
+        ("17.06.2019", "7.50"), ("29.07.2019", "7.25"), ("09.09.2019", "7.00"),
+        ("28.10.2019", "6.50"), ("16.12.2019", "6.25"), ("10.02.2020", "6.00"),
+        ("27.04.2020", "5.50"), ("22.06.2020", "4.50"), ("27.07.2020", "4.25"),
+        ("22.03.2021", "4.50"), ("26.04.2021", "5.00"), ("15.06.2021", "5.50"),
+        ("26.07.2021", "6.50"), ("13.09.2021", "6.75"), ("25.10.2021", "7.50"),
+        ("20.12.2021", "8.50"), ("14.02.2022", "9.50"), ("28.02.2022", "20.00"),
+        ("11.04.2022", "17.00"), ("04.05.2022", "14.00"), ("27.05.2022", "11.00"),
+        ("14.06.2022", "9.50"), ("25.07.2022", "8.00"), ("19.09.2022", "7.50"),
+        ("24.07.2023", "8.50"), ("15.08.2023", "12.00"), ("18.09.2023", "13.00"),
+        ("30.10.2023", "15.00"), ("18.12.2023", "16.00"), ("29.07.2024", "18.00"),
+        ("16.09.2024", "19.00"), ("28.10.2024", "21.00"), ("09.06.2025", "20.00"),
     ]
     key_rates = []
     for date_str, rate_str in rates_data:
@@ -70,7 +38,6 @@ def get_key_rates_from_395gk():
                 f"Ошибка парсинга ставки: {date_str}, {rate_str}, {e}")
             continue
 
-    # Преобразуем в формат (дата_начала, дата_окончания, ставка)
     result = []
     for i in range(len(key_rates)):
         date_from, rate = key_rates[i]
@@ -92,7 +59,7 @@ def split_period_by_key_rate(start: datetime, end: datetime, key_rates):
         actual_end = min(end, k_end)
         if actual_start <= actual_end:
             periods.append((actual_start, actual_end, rate))
-    return sorted(periods, key=lambda x: x[0])  # Сортировка по дате начала
+    return sorted(periods, key=lambda x: x[0])
 
 
 def calc_395_on_periods(base_sum, periods):
@@ -169,7 +136,91 @@ def parse_periods_from_docx(docx_path):
             continue
     if not periods:
         raise ValueError("Не удалось распарсить ни одной строки из таблицы")
-    return periods
+    return periods, current_sum
+
+
+def parse_claim_data(docx_path):
+    doc = Document(docx_path)
+    text = "\n".join(p.text for p in doc.paragraphs)
+
+    # Истец
+    plaintiff_match = re.search(
+        r"от\s+Обществ[о|а].*?«(.+?)»\s+ИНН\s+(\d+)\s+КПП\s+(\d+)\s+ОГРН\s+(\d+)\s+(.+?)\s*\n",
+        text, re.DOTALL
+    )
+    plaintiff = {
+        'name': plaintiff_match.group(1).strip() if plaintiff_match else "Не указано",
+        'inn': plaintiff_match.group(2).strip() if plaintiff_match else "Не указано",
+        'kpp': plaintiff_match.group(3).strip() if plaintiff_match else "Не указано",
+        'ogrn': plaintiff_match.group(4).strip() if plaintiff_match else "Не указано",
+        'address': plaintiff_match.group(5).strip() if plaintiff_match else "Не указано"
+    }
+
+    # Ответчик
+    defendant_match = re.search(
+        r"Обществу\s+с\s+ограниченной\s+ответственностью\s+«(.+?)»\s+ИНН\s+(\d+)\s+КПП\s+(\d+)\s+ОГРН\s+(\d+)\s+(.+?)\s*\n",
+        text, re.DOTALL
+    )
+    defendant = {
+        'name': defendant_match.group(1).strip() if defendant_match else "Не указано",
+        'inn': defendant_match.group(2).strip() if defendant_match else "Не указано",
+        'kpp': defendant_match.group(3).strip() if defendant_match else "Не указано",
+        'ogrn': defendant_match.group(4).strip() if defendant_match else "Не указано",
+        'address': defendant_match.group(5).strip() if defendant_match else "Не указано"
+    }
+
+    # Сумма долга
+    debt_match = re.search(r"Сумма основного долга: ([\d\s,.]+)\s*р.", text)
+    debt = float(debt_match.group(1).replace(
+        ' ', '').replace(',', '.')) if debt_match else 0.0
+
+    # Юридические услуги
+    legal_fees_match = re.search(
+        r"юридические услуги.*?([\d\s,.]+)\s*рублей", text)
+    legal_fees = float(legal_fees_match.group(1).replace(
+        ' ', '').replace(',', '.')) if legal_fees_match else 0.0
+
+    # Договоры
+    contracts_match = re.findall(
+        r"договор - заявк[а|у] на перевозку груза № (\d+) от (\d{2}\.\d{2}\.\d{4})", text)
+    contracts = [f"№ {num} от {date}" for num, date in contracts_match]
+
+    # Счета
+    invoices_match = re.findall(
+        r"Счетом на оплату № (\d+) от (\d{2}\.\d{2}\.\d{4})", text)
+    invoices = [f"№ {num} от {date}" for num, date in invoices_match]
+
+    # УПД
+    upds_match = re.findall(r"УПД № (\d+) от (\d{2}\.\d{2}\.\d{4})", text)
+    upds = [f"№ {num} от {date}" for num, date in upds_match]
+
+    # Претензия
+    claim_date_match = re.search(
+        r"(\d{2}\.\d{2}\.\d{4})\s+Истцом.*претензия", text)
+    claim_date = claim_date_match.group(
+        1).strip() if claim_date_match else "Не указано"
+    claim_number_match = re.search(r"трек\s*номером\s*(\d+)", text)
+    claim_number = claim_number_match.group(
+        1).strip() if claim_number_match else "66407402018576"
+
+    # Подписант
+    signatory_match = re.search(
+        r"Генеральный директор.*?/(.+?)/", text, re.DOTALL)
+    signatory = signatory_match.group(
+        1).strip() if signatory_match else "Не указано"
+
+    return {
+        'plaintiff': plaintiff,
+        'defendant': defendant,
+        'debt': debt,
+        'legal_fees': legal_fees,
+        'contracts': contracts,
+        'invoices': invoices,
+        'upds': upds,
+        'claim_date': claim_date,
+        'claim_number': claim_number,
+        'signatory': signatory
+    }
 
 
 def calculate_full_395(docx_path, today=None, key_rates=None):
@@ -178,11 +229,10 @@ def calculate_full_395(docx_path, today=None, key_rates=None):
     logging.info(f"Текущая дата: {today.strftime('%d.%m.%Y')}")
     if key_rates is None:
         key_rates = get_key_rates_from_395gk()
-    periods = parse_periods_from_docx(docx_path)
+    periods, base_sum = parse_periods_from_docx(docx_path)
     total_interest = 0
     details = []
 
-    # Считаем проценты из таблицы
     for p in periods:
         year_days = 366 if p['date_from'].year % 4 == 0 and (
             p['date_from'].year % 100 != 0 or p['date_from'].year % 400 == 0) else 365
@@ -191,14 +241,13 @@ def calculate_full_395(docx_path, today=None, key_rates=None):
             'date_from': p['date_from'].strftime('%d.%m.%Y'),
             'date_to': p['date_to'].strftime('%d.%m.%Y'),
             'rate': p['rate'],
-            'days': p['days'],
+            'days': days,
             'interest': round(interest, 2),
             'sum': p['sum'],
             'formula': f"{p['sum']:,.2f} × {p['days']} × {p['rate']}% / {year_days}".replace(',', ' ')
         })
         total_interest += interest
 
-    # Досчитываем до текущей даты
     if periods:
         last = periods[-1]
         logging.info(
@@ -219,38 +268,8 @@ def calculate_full_395(docx_path, today=None, key_rates=None):
             details.extend(details_actual)
             total_interest += total_actual
 
-    return round(total_interest, 2), details
-
-
-def write_calc_to_docx(docx_path, total, details):
-    doc = Document()
-    doc.add_heading("Расчет процентов по ст. 395 ГК РФ", 0)
-    table = doc.add_table(rows=1, cols=7)
-    hdr_cells = table.rows[0].cells
-    hdr_cells[0].text = "Задолженность"
-    hdr_cells[1].text = "Период просрочки (с)"
-    hdr_cells[2].text = "Период просрочки (по)"
-    hdr_cells[3].text = "Дней"
-    hdr_cells[4].text = "Ставка"
-    hdr_cells[5].text = "Формула"
-    hdr_cells[6].text = "Проценты"
-
-    for d in details:
-        row_cells = table.add_row().cells
-        row_cells[0].text = f"{d['sum']:,.2f} р.".replace(',', ' ')
-        row_cells[1].text = d['date_from']
-        row_cells[2].text = d['date_to']
-        row_cells[3].text = str(d['days'])
-        row_cells[4].text = f"{d['rate']}"
-        row_cells[5].text = d['formula']
-        row_cells[6].text = f"{d['interest']:,.2f} р.".replace(',', ' ')
-
-    doc.add_paragraph()
-    p = doc.add_paragraph(
-        f"Сумма основного долга: {details[-1]['sum']:,.2f} р.".replace(',', ' '))
-    p.runs[0].font.size = Pt(12)
-    p = doc.add_paragraph(
-        f"Сумма процентов: {total:,.2f} р.".replace(',', ' '))
-    p.runs[0].font.size = Pt(12)
-
-    doc.save(docx_path)
+    return {
+        'total_interest': round(total_interest, 2),
+        'details': details,
+        'base_sum': base_sum
+    }
