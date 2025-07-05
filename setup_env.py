@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
-Скрипт для настройки переменных окружения
+Скрипт для настройки переменных окружения проекта.
 """
 
 import os
 
 
-def create_env_file():
-    """Создает файл .env с токеном бота"""
+def create_env_file() -> None:
+    """
+    Создает файл .env с токеном бота.
+
+    Если файл уже существует, выводит предупреждение.
+    """
     env_content = """# Telegram Bot Token
 # Получите токен у @BotFather в Telegram
 TELEGRAM_BOT_TOKEN=your_bot_token_here
@@ -23,8 +27,16 @@ TELEGRAM_BOT_TOKEN=your_bot_token_here
         f.write(env_content)
 
     print("Файл .env создан!")
-    print("Не забудьте заменить 'your_bot_token_here' на ваш реальный токен бота")
+    print(
+        "Не забудьте заменить 'your_bot_token_here' "
+        "на ваш реальный токен бота"
+    )
+
+
+def main() -> None:
+    """Основная функция скрипта."""
+    create_env_file()
 
 
 if __name__ == "__main__":
-    create_env_file()
+    main()
