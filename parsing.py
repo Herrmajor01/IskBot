@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Модуль для парсинга данных из .docx файлов (исковые требования, периоды).
 """
@@ -152,46 +153,34 @@ def parse_periods_from_docx(
     return periods, current_sum
 
 
+def is_valid_date(date_str: str) -> bool:
+    """
+    Проверяет, является ли строка корректной датой.
+
+    Args:
+        date_str: Строка с датой
+
+    Returns:
+        True если дата корректна, False иначе
+    """
+    try:
+        d = datetime.strptime(date_str.replace('/', '.'), '%d.%m.%Y')
+        return 2000 <= d.year <= 2099
+    except Exception:
+        return False
+
+
 def parse_contract_applications(text: str) -> str:
     """
-    Парсит договоры-заявки на перевозку груза целиком.
-    Возвращает полную фразу для подстановки в шаблон.
+    Парсит договоры-заявки на перевозку груза используя правильную логику группировки.
     """
-    # Паттерны для поиска договоров-заявок
-    patterns = [
-        # Договор-заявка (единственное число)
-        (r'договор-заявка[а-яё\s\-]*на перевозку груза[^;\n]*?'
-         r'(?:№\s*\d+[^;\n]*?от\s*\d{2}\.\d{2}\.\d{4}[^;\n]*?г?\.?|'
-         r'от\s*\d{2}\.\d{2}\.\d{4}[^;\n]*?г?\.?)[^;\n]*'),
-        # Договор - заявки (множественное число)
-        (r'договор\s*-\s*заявки[а-яё\s\-]*на перевозку груза[^;\n]*?'
-         r'(?:№\s*\d+[^;\n]*?от\s*\d{2}\.\d{2}\.\d{4}[^;\n]*?г?\.?|'
-         r'от\s*\d{2}\.\d{2}\.\d{4}[^;\n]*?г?\.?)[^;\n]*'),
-        # Договоры-заявки (множественное число)
-        (r'договоры-заявки[а-яё\s\-]*на перевозку груза[^;\n]*?'
-         r'(?:№\s*\d+[^;\n]*?от\s*\d{2}\.\d{2}\.\d{4}[^;\n]*?г?\.?|'
-         r'от\s*\d{2}\.\d{2}\.\d{4}[^;\n]*?г?\.?)[^;\n]*'),
-        # Договор-заявка без дефиса
-        (r'договор\s+заявка[а-яё\s\-]*на перевозку груза[^;\n]*?'
-         r'(?:№\s*\d+[^;\n]*?от\s*\d{2}\.\d{2}\.\d{4}[^;\n]*?г?\.?|'
-         r'от\s*\d{2}\.\d{2}\.\d{4}[^;\n]*?г?\.?)[^;\n]*'),
-    ]
+    from simple_parser import find_documents_with_numbers_grouped
 
-    found_contracts = []
+    # Используем правильный парсер из simple_parser.py
+    documents = find_documents_with_numbers_grouped(text)
 
-    for pattern in patterns:
-        matches = re.finditer(pattern, text, re.IGNORECASE)
-        for match in matches:
-            contract_text = match.group(0).strip()
-            # Очищаем от лишних пробелов и переносов строк
-            contract_text = re.sub(r'\s+', ' ', contract_text)
-            if contract_text not in found_contracts:
-                found_contracts.append(contract_text)
-
-    if found_contracts:
-        return '; '.join(found_contracts)
-    else:
-        return "Не указано"
+    # Возвращаем contract_applications из результатов
+    return documents.get('contract_applications', 'Не указано')
 
 
 def parse_cargo_documents(text: str) -> str:
@@ -218,51 +207,45 @@ def parse_cargo_documents(text: str) -> str:
     for match in transport_matches:
         name = match.group(1)
         if match.group(2) and match.group(3):  # есть номер и дата
-            doc_text = f"{name} № {match.group(2)} от {match.group(3)}"
-        elif match.group(4):  # только дата
-            doc_text = f"{name} от {match.group(4)}"
-        else:
-            doc_text = name
-        if doc_text not in found_documents:
-            found_documents.append(doc_text)
+            found_documents.append(
+                f"{name} № {match.group(2)} от {match.group(3)} г.")
+        elif match.group(4):  # есть только дата
+            found_documents.append(
+                f"{name} от {match.group(4)} г.")
 
-    # 3. Товарно-транспортная накладная
-    ttn_matches = re.finditer(
-        r'([Тт]оварно-транспортн[а-яё]* накладн[а-яё]*)\s*'
-        r'(?:№\s*(\d+)\s*от\s*(\d{2}\.\d{2}\.\d{4})|'
-        r'от\s*(\d{2}\.\d{2}\.\d{4}))',
-        text, re.IGNORECASE
-    )
-    for match in ttn_matches:
-        name = match.group(1)
-        if match.group(2) and match.group(3):  # есть номер и дата
-            doc_text = f"{name} № {match.group(2)} от {match.group(3)}"
-        elif match.group(4):  # только дата
-            doc_text = f"{name} от {match.group(4)}"
-        else:
-            doc_text = name
-        if doc_text not in found_documents:
-            found_documents.append(doc_text)
-
-    # 4. Товарная накладная
-    tovarnaya_matches = re.finditer(
+    # 3. Товарная накладная - название + номер + дата
+    tovar_matches = re.finditer(
         r'([Тт]оварн[а-яё]* накладн[а-яё]*)\s*'
         r'(?:№\s*(\d+)\s*от\s*(\d{2}\.\d{2}\.\d{4})|'
         r'от\s*(\d{2}\.\d{2}\.\d{4}))',
         text, re.IGNORECASE
     )
-    for match in tovarnaya_matches:
+    for match in tovar_matches:
         name = match.group(1)
         if match.group(2) and match.group(3):  # есть номер и дата
-            doc_text = f"{name} № {match.group(2)} от {match.group(3)}"
-        elif match.group(4):  # только дата
-            doc_text = f"{name} от {match.group(4)}"
-        else:
-            doc_text = name
-        if doc_text not in found_documents:
-            found_documents.append(doc_text)
+            found_documents.append(
+                f"{name} № {match.group(2)} от {match.group(3)} г.")
+        elif match.group(4):  # есть только дата
+            found_documents.append(
+                f"{name} от {match.group(4)} г.")
 
-    # 5. Счет-фактура
+    # 4. Товарно-транспортная накладная - название + номер + дата
+    tt_matches = re.finditer(
+        r'([Тт]оварно-транспортн[а-яё]* накладн[а-яё]*)\s*'
+        r'(?:№\s*(\d+)\s*от\s*(\d{2}\.\d{2}\.\d{4})|'
+        r'от\s*(\d{2}\.\d{2}\.\d{4}))',
+        text, re.IGNORECASE
+    )
+    for match in tt_matches:
+        name = match.group(1)
+        if match.group(2) and match.group(3):  # есть номер и дата
+            found_documents.append(
+                f"{name} № {match.group(2)} от {match.group(3)} г.")
+        elif match.group(4):  # есть только дата
+            found_documents.append(
+                f"{name} от {match.group(4)} г.")
+
+    # 5. Счет-фактура - название + номер + дата
     sf_matches = re.finditer(
         r'([Сс]чет-фактур[а-яё]*)\s*'
         r'(?:№\s*(\d+)\s*от\s*(\d{2}\.\d{2}\.\d{4})|'
@@ -272,13 +255,11 @@ def parse_cargo_documents(text: str) -> str:
     for match in sf_matches:
         name = match.group(1)
         if match.group(2) and match.group(3):  # есть номер и дата
-            doc_text = f"{name} № {match.group(2)} от {match.group(3)}"
-        elif match.group(4):  # только дата
-            doc_text = f"{name} от {match.group(4)}"
-        else:
-            doc_text = name
-        if doc_text not in found_documents:
-            found_documents.append(doc_text)
+            found_documents.append(
+                f"{name} № {match.group(2)} от {match.group(3)} г.")
+        elif match.group(4):  # есть только дата
+            found_documents.append(
+                f"{name} от {match.group(4)} г.")
 
     # Исключаем любые фразы вида 'Грузосопроводительными документами', 'Грузосопроводительный документ' и т.п.
     found_documents = [d for d in found_documents if not re.match(
@@ -290,223 +271,289 @@ def parse_cargo_documents(text: str) -> str:
         return "Не указано"
 
 
+def parse_attachments(text: str) -> list:
+    """
+    Парсит раздел 'Приложения' и возвращает список приложений.
+    Ищет все строки после заголовка до первой пустой строки или нового раздела.
+    Разделяет по точке с запятой.
+    """
+    attachments = []
+    match = re.search(
+        r'Приложени[еяи]{1,2}\s*:?\s*([\s\S]+)', text, re.IGNORECASE)
+    if not match:
+        logging.info('DEBUG: Не найден раздел Приложения')
+        return attachments
+    after_header = match.group(1)
+    logging.info('DEBUG: Текст после Приложения: %s', after_header[:300])
+    # Берём только до первой пустой строки или до "Генеральный директор"
+    stop_match = re.search(r'\n\s*\n|Генеральный директор', after_header)
+    if stop_match:
+        after_header = after_header[:stop_match.start()]
+    # Разделяем по точке с запятой
+    for item in after_header.split(';'):
+        item = item.strip()
+        if item:
+            attachments.append(item)
+    logging.info('DEBUG: Найденные приложения: %s', attachments)
+    return attachments
+
+
 def parse_claim_data(docx_path: str) -> Dict[str, Any]:
     """
-    Извлекает данные иска из .docx:
-     истец, ответчик, суммы, договоры, счета, УПД и др.
+    Парсит данные из .docx файла с досудебным требованием.
+
+    Args:
+        docx_path: Путь к .docx файлу
+
+    Returns:
+        Словарь с данными истца, ответчика и другими параметрами
     """
     doc = Document(docx_path)
     text = "\n".join(p.text for p in doc.paragraphs)
 
-    plaintiff_match = re.search(
-        r"((?:Обществ[оа] с ограниченной ответственностью|Индивидуальный предприниматель|Закрытое акционерное общество|Публичное акционерное общество|Открытое акционерное общество|Акционерное общество|АО|ООО|ИП|ЗАО|ПАО)[^«]*«.+?»)\s+ИНН\s+(\d+)\s+КПП\s+(\d+)?\s+ОГРН\s+(\d+)?\s+(.+?)\s*\n",
-        text, re.DOTALL
-    )
-    plaintiff = {
-        'name': (
-            plaintiff_match.group(1).strip(
-            ) if plaintiff_match else "Не указано"
-        ),
-        'inn': (
-            plaintiff_match.group(2).strip(
-            ) if plaintiff_match else "Не указано"
-        ),
-        'kpp': (
-            plaintiff_match.group(3).strip(
-            ) if plaintiff_match else "Не указано"
-        ),
-        'ogrn': (
-            plaintiff_match.group(4).strip(
-            ) if plaintiff_match else "Не указано"
-        ),
-        'address': (
-            plaintiff_match.group(5).strip(
-            ) if plaintiff_match else "Не указано"
-        ),
-    }
-    # Сокращаем длинные формы до аббревиатуры
-    plaintiff['name'] = re.sub(
-        r"Обществ[оа] с ограниченной ответственностью", "ООО", plaintiff['name'])
-    plaintiff['name'] = re.sub(
-        r"Индивидуальный предприниматель", "ИП", plaintiff['name'])
-    plaintiff['name'] = re.sub(
-        r"Закрытое акционерное общество", "ЗАО", plaintiff['name'])
-    plaintiff['name'] = re.sub(
-        r"Публичное акционерное общество", "ПАО", plaintiff['name'])
-    plaintiff['name'] = re.sub(
-        r"Открытое акционерное общество", "ОАО", plaintiff['name'])
-    plaintiff['name'] = re.sub(
-        r"Акционерное общество", "АО", plaintiff['name'])
+    # Извлекаем блоки истца и ответчика
+    defendant_block = None
+    plaintiff_block = None
 
-    defendant_match = re.search(
-        r"(Обществ[оа] с ограниченной ответственностью|Индивидуальному предпринимателю|Закрытому акционерному обществу|Публичному акционерному обществу|Открытому акционерному обществу|Акционерному обществу|АО|ООО|ИП|ЗАО|ПАО)\s+«(.+?)»\s+"
-        r"ИНН\s+(\d+)\s+КПП\s+(\d+)\s+ОГРН\s+(\d+)\s+(.+?)\s*\n",
-        text, re.DOTALL
-    )
-    defendant = {
-        'name': (
-            (defendant_match.group(1).strip() + ' «' +
-             defendant_match.group(2).strip() + '»') if defendant_match else "Не указано"
-        ),
-        'inn': (
-            defendant_match.group(3).strip(
-            ) if defendant_match else "Не указано"
-        ),
-        'kpp': (
-            defendant_match.group(4).strip(
-            ) if defendant_match else "Не указано"
-        ),
-        'ogrn': (
-            defendant_match.group(5).strip(
-            ) if defendant_match else "Не указано"
-        ),
-        'address': (
-            defendant_match.group(6).strip(
-            ) if defendant_match else "Не указано"
-        ),
-    }
-    # Сокращаем длинные формы до аббревиатуры для defendant
-    for long, short in [
-        (r"Обществ[оа] с ограниченной ответственностью", "ООО"),
-        (r"Индивидуальный предприниматель", "ИП"),
-        (r"Индивидуальному предпринимателю", "ИП"),
-        (r"Закрытое акционерное общество", "ЗАО"),
-        (r"Закрытому акционерному обществу", "ЗАО"),
-        (r"Публичное акционерное общество", "ПАО"),
-        (r"Публичному акционерному обществу", "ПАО"),
-        (r"Открытое акционерное общество", "ОАО"),
-        (r"Открытому акционерному обществу", "ОАО"),
-        (r"Акционерное общество", "АО"),
-        (r"Акционерному обществу", "АО"),
-    ]:
-        defendant['name'] = re.sub(long, short, defendant['name'])
+    # Ищем блок ответчика (начинается с "Обществу с ограниченной ответственностью" и т.д.)
+    defendant_pattern = r'(Обществу с ограниченной ответственностью[^]*?)(?=\n\n|\nот|\nТРЕБОВАНИЕ|\nПРЕТЕНЗИЯ)'
+    defendant_match = re.search(defendant_pattern, text, re.DOTALL)
+    if defendant_match:
+        defendant_block = defendant_match.group(1).strip()
+
+    # Ищем блок истца (начинается с "от Индивидуального предпринимателя" и т.д.)
+    plaintiff_pattern = r'(от Индивидуального предпринимателя[^]*?)(?=\n\n|\nТРЕБОВАНИЕ|\nПРЕТЕНЗИЯ)'
+    plaintiff_match = re.search(plaintiff_pattern, text, re.DOTALL)
+    if plaintiff_match:
+        plaintiff_block = plaintiff_match.group(1).strip()
+
+    def extract_requisites(block: str) -> Dict[str, str]:
+        """
+        Извлекает реквизиты из блока текста.
+
+        Args:
+            block: Текст с реквизитами
+
+        Returns:
+            Словарь с реквизитами
+        """
+        # Простой парсер реквизитов - берем как есть
+        lines = block.split('\n')
+        name = ''
+        inn = ''
+        kpp = ''
+        ogrn = ''
+        ogrnip = ''
+        address = ''
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            if 'ИНН' in line:
+                inn_match = re.search(r'ИНН\s*(\d+)', line)
+                inn = inn_match.group(1) if inn_match else ''
+            elif 'КПП' in line:
+                kpp_match = re.search(r'КПП\s*(\d+)', line)
+                kpp = kpp_match.group(1) if kpp_match else ''
+            elif 'ОГРНИП' in line:
+                ogrnip_match = re.search(r'ОГРНИП\s*(\d+)', line)
+                ogrnip = ogrnip_match.group(1) if ogrnip_match else ''
+            elif 'ОГРН' in line:
+                ogrn_match = re.search(r'ОГРН\s*(\d+)', line)
+                ogrn = ogrn_match.group(1) if ogrn_match else ''
+            elif inn and (kpp or ogrnip) and not address:
+                # Адрес - первая строка после всех реквизитов
+                address = line
+            elif not name and ('ООО' in line or 'ИП' in line or 'Обществ' in line or 'Индивидуального предпринимателя' in line):
+                # Имя - первая строка с названием организации
+                name = line
+                # Ограничиваем до кавычек, если есть
+                if '«' in name and '»' in name:
+                    start = name.find('«')
+                    end = name.find('»')
+                    if start != -1 and end != -1:
+                        org_type = name[:start].strip()
+                        org_name = name[start+1:end].strip()
+                        name = f"{org_type} «{org_name}»"
+
+        # Для ИП используем ОГРНИП вместо ОГРН, и не показываем КПП
+        if 'ИП' in name or 'Индивидуальный предприниматель' in name:
+            return {
+                'name': name if name else 'Не указано',
+                'inn': inn if inn else 'Не указано',
+                'kpp': '',  # У ИП нет КПП
+                'ogrn': ogrnip if ogrnip else 'Не указано',  # Используем ОГРНИП
+                'address': address if address else 'Не указано',
+            }
+        else:
+            return {
+                'name': name if name else 'Не указано',
+                'inn': inn if inn else 'Не указано',
+                'kpp': kpp if kpp else 'Не указано',
+                'ogrn': ogrn if ogrn else 'Не указано',
+                'address': address if address else 'Не указано',
+            }
+
+    # Если нашли оба блока — используем их, иначе fallback на старый способ
+    if defendant_block and plaintiff_block:
+        defendant = extract_requisites(defendant_block)
+        plaintiff = extract_requisites(plaintiff_block)
+    else:
+        # --- Fallback: старый способ ---
+        plaintiff_match = re.search(
+            r"((?:Обществ[оа] с ограниченной ответственностью|"
+            r"Индивидуальный предприниматель|"
+            r"Закрытое акционерное общество|"
+            r"Публичное акционерное общество|"
+            r"Открытое акционерное общество|"
+            r"Акционерное общество|АО|ООО|ИП|ЗАО|ПАО)[^«]*«.+?»)\s+ИНН\s+"
+            r"(\d+)\s+КПП\s+(\d+)?\s+ОГРН\s+(\d+)?\s+(.+?)\s*\n",
+            text, re.DOTALL
+        )
+        plaintiff = {
+            'name': (
+                plaintiff_match.group(1).strip()
+                if plaintiff_match else "Не указано"
+            ),
+            'inn': (
+                plaintiff_match.group(2).strip()
+                if plaintiff_match else "Не указано"
+            ),
+            'kpp': (
+                plaintiff_match.group(3).strip()
+                if plaintiff_match else "Не указано"
+            ),
+            'ogrn': (
+                plaintiff_match.group(4).strip()
+                if plaintiff_match else "Не указано"
+            ),
+            'address': (
+                plaintiff_match.group(5).strip()
+                if plaintiff_match else "Не указано"
+            ),
+        }
+        # Сокращаем длинные формы до аббревиатуры
+        plaintiff['name'] = re.sub(
+            r"Обществ[оа] с ограниченной ответственностью", "ООО", plaintiff['name'])
+        plaintiff['name'] = re.sub(
+            r"Индивидуальный предприниматель", "ИП", plaintiff['name'])
+        plaintiff['name'] = re.sub(
+            r"Закрытое акционерное общество", "ЗАО", plaintiff['name'])
+        plaintiff['name'] = re.sub(
+            r"Публичное акционерное общество", "ПАО", plaintiff['name'])
+        plaintiff['name'] = re.sub(
+            r"Открытое акционерное общество", "ОАО", plaintiff['name'])
+        plaintiff['name'] = re.sub(
+            r"Акционерное общество", "АО", plaintiff['name'])
+
+        defendant_match = re.search(
+            r"(Обществ[оа] с ограниченной ответственностью|"
+            r"Индивидуальному предпринимателю|"
+            r"Закрытому акционерному обществу|"
+            r"Публичному акционерному обществу|"
+            r"Открытому акционерному обществу|"
+            r"Акционерному обществу|АО|ООО|ИП|ЗАО|ПАО)\s+«(.+?)»\s+"
+            r"ИНН\s+(\d+)\s+КПП\s+(\d+)\s+ОГРН\s+(\d+)\s+(.+?)\s*\n",
+            text, re.DOTALL
+        )
+        defendant = {
+            'name': (
+                f"{defendant_match.group(1)} «{defendant_match.group(2)}»"
+                if defendant_match else "Не указано"
+            ),
+            'inn': (
+                defendant_match.group(3).strip()
+                if defendant_match else "Не указано"
+            ),
+            'kpp': (
+                defendant_match.group(4).strip()
+                if defendant_match else "Не указано"
+            ),
+            'ogrn': (
+                defendant_match.group(5).strip()
+                if defendant_match else "Не указано"
+            ),
+            'address': (
+                defendant_match.group(6).strip()
+                if defendant_match else "Не указано"
+            ),
+        }
+
+    # Извлекаем сумму задолженности
     debt_match = re.search(
-        r"Сумма\s*основного\s*долга\s*:?\s*([\d\s,.]+)\s*р?\.?",
-        text,
-        re.IGNORECASE
+        r'Стоимость услуг по договор[^0-9]*составила\s*([0-9\s,]+)\s*рубл',
+        text, re.IGNORECASE
     )
+    debt = 0.0
     if debt_match:
+        debt_str = debt_match.group(1).replace(' ', '').replace(',', '.')
         try:
-            debt = float(
-                debt_match.group(1).replace(' ', '').replace(',', '.')
-            )
+            debt = float(debt_str)
         except ValueError:
-            debt = 0.0
-    else:
-        debt = 0.0
-        try:
-            if doc.tables:
-                table = doc.tables[0]
-                for row in table.rows:
-                    cells = row.cells
-                    if len(cells) >= 1:
-                        cell_text = cells[0].text.strip()
-                        if "Сумма основного долга:" in cell_text:
-                            debt_match = re.search(
-                                r'(\d[\d\s,.]*)\s*р?\.?', cell_text)
-                            if debt_match:
-                                debt_text = debt_match.group(1).replace(
-                                    ' ', '').replace(',', '.')
-                                debt = float(debt_text)
-                                break
-        except Exception as e:
-            logging.warning(f"Ошибка при поиске суммы долга в таблице: {e}")
-            debt = 0.0
+            pass
+
+    # Извлекаем юридические услуги
     legal_fees_match = re.search(
-        r"юридические\s+услуги.*?([\d\s,.]+)\s*рубл", text, re.IGNORECASE)
-    if legal_fees_match:
-        try:
-            legal_fees = float(legal_fees_match.group(
-                1).replace(' ', '').replace(',', '.'))
-        except ValueError:
-            legal_fees = 0.0
-    else:
-        legal_fees = 0.0
-    contracts_match = re.findall(
-        r"(?:договор[а-я\- ]*|заявка на перевозку груза)[^\n\r№]*"
-        r"№\s*(\d+)\s*от\s*(\d{2}\.\d{2}\.\d{4})",
-        text, re.IGNORECASE)
-    contracts = [f"№ {num} от {date}" for num, date in contracts_match]
-    # --- Парсинг счетов на оплату ---
-    invoices = []
-    for paragraph in text.split('\n'):
-        for match in re.finditer(r'Счет(?:ом)? на оплату([^;\n]*)', paragraph, re.IGNORECASE):
-            group = match.group(1)
-            pairs = re.findall(
-                r'№\s*(\d+)\s*от\s*(\d{2}\.\d{2}\.\d{4})', group)
-            invoices.extend([f"№ {num} от {date}" for num, date in pairs])
-    # --- Парсинг УПД ---
-    upds = []
-    for paragraph in text.split('\n'):
-        for match in re.finditer(r'УПД([^;\n]*)', paragraph, re.IGNORECASE):
-            group = match.group(1)
-            pairs = re.findall(
-                r'№\s*(\d+)\s*от\s*(\d{2}\.\d{2}\.\d{4})', group)
-            upds.extend([f"№ {num} от {date}" for num, date in pairs])
-    claim_date_match = re.search(
-        r"(\d{2}\.\d{2}\.\d{4})\s+Истцом.*претензия", text)
-    claim_date = claim_date_match.group(
-        1).strip() if claim_date_match else "Не указано"
-    claim_number_match = re.search(r"трек\s*номером\s*(\d+)", text)
-    claim_number = (
-        claim_number_match.group(1).strip()
-        if claim_number_match else "66407402018576"
+        r'юридические услуги\s*([0-9\s,]+)\s*рубл',
+        text, re.IGNORECASE
     )
-    # --- Новый парсинг подписанта ---
+    legal_fees = 0.0
+    if legal_fees_match:
+        legal_fees_str = legal_fees_match.group(
+            1).replace(' ', '').replace(',', '.')
+        try:
+            legal_fees = float(legal_fees_str)
+        except ValueError:
+            pass
+
+    # Извлекаем подписанта
     signatory_match = re.search(
-        r"_{3,}\s*/([^/\n]+)", text)
+        r'_________________\s*/([^/]+)/',
+        text
+    )
     signatory = signatory_match.group(
         1).strip() if signatory_match else "Не указано"
-    # --- Новый парсинг почтовых уведомлений ---
-    postal_numbers = []
-    postal_dates = []
-    for paragraph in text.split('\n'):
-        if re.search(r'почтов[а-яё ]*уведомлени[еия]?', paragraph, re.IGNORECASE):
-            matches = re.findall(
-                r'№\s*(\d+)[^\d]{0,40}?об отправке и получении[^\d]{0,40}?(\d{2}\.\d{2}\.\d{4})',
-                paragraph,
-                re.IGNORECASE
-            )
-            for num, date in matches:
-                if (num, date) not in zip(postal_numbers, postal_dates):
-                    postal_numbers.append(num)
-                    postal_dates.append(date)
-    # --- Парсинг договоров-заявок целиком ---
-    contract_applications = parse_contract_applications(text)
 
-    # --- Парсинг грузосопроводительных документов ---
-    cargo_documents = parse_cargo_documents(text)
+    # Извлекаем приложения
+    attachments = parse_attachments(text)
 
-    # --- Парсинг счетов на оплату целиком ---
-    invoice_blocks = parse_invoice_blocks(text)
+    # Извлекаем счета и УПД
+    invoices = []
+    upds = []
 
-    # --- Парсинг УПД целиком ---
-    upd_blocks = parse_upd_blocks(text)
+    # Счета на оплату
+    invoice_matches = re.finditer(
+        r'Счет[а-яё]* на оплату\s*№\s*(\d+)\s*от\s*(\d{2}\.\d{2}\.\d{4})',
+        text, re.IGNORECASE
+    )
+    for match in invoice_matches:
+        invoices.append(f"№ {match.group(1)} от {match.group(2)}")
 
-    # --- конец нового парсинга ---
-    payment_days_match = re.search(
-        r'оплата производится в течение\s+(\d+)\s+банковск', text, re.IGNORECASE)
-    payment_days = payment_days_match.group(
-        1) if payment_days_match else "Не указано"
+    # УПД
+    upd_matches = re.finditer(
+        r'УПД\s*№\s*(\d+)\s*от\s*(\d{2}\.\d{2}\.\d{4})',
+        text, re.IGNORECASE
+    )
+    for match in upd_matches:
+        upds.append(f"№ {match.group(1)} от {match.group(2)}")
+
+    # Извлекаем блоки документов
+    from sliding_window_parser import parse_documents_with_sliding_window
+    document_blocks = parse_documents_with_sliding_window(text)
 
     return {
         'plaintiff': plaintiff,
         'defendant': defendant,
         'debt': debt,
         'legal_fees': legal_fees,
-        'contracts': contracts,
+        'signatory': signatory,
+        'attachments': attachments,
         'invoices': invoices,
         'upds': upds,
-        'claim_date': claim_date,
-        'claim_number': claim_number,
-        'signatory': signatory,
-        'postal_numbers': postal_numbers,
-        'postal_dates': postal_dates,
-        'contract_applications': contract_applications,
-        'cargo_documents': cargo_documents,
-        'invoice_blocks': invoice_blocks,
-        'upd_blocks': upd_blocks,
-        'payment_days': payment_days,
+        'contract_applications': parse_contract_applications(text),
+        'cargo_docs': parse_cargo_documents(text),
+        'document_blocks': document_blocks
     }
 
 
@@ -558,3 +605,18 @@ def parse_upd_blocks(text: str) -> str:
         return '; '.join(found_blocks)
     else:
         return "Не указано"
+
+
+def extract_document_blocks(text: str) -> Dict[str, str]:
+    """
+    Основная функция извлечения блоков документов.
+    Использует парсер из sliding_window_parser.py.
+
+    Args:
+        text: Текст для парсинга
+
+    Returns:
+        Словарь с извлеченными блоками документов
+    """
+    from sliding_window_parser import parse_documents_with_sliding_window
+    return parse_documents_with_sliding_window(text)

@@ -7,7 +7,6 @@ import logging
 import os
 import tempfile
 import uuid
-from copy import deepcopy
 from datetime import datetime
 from typing import Tuple
 
@@ -25,6 +24,7 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
 from cal import calculate_duty
 from calc_395 import calculate_full_395, get_key_rates_from_395gk
 from parsing import parse_claim_data
+from sliding_window_parser import parse_documents_with_sliding_window
 
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -68,7 +68,6 @@ def get_court_by_address(defendant_address: str) -> Tuple[str, str]:
             "Арбитражный суд Республики Карелия",
             "185035, г. Петрозаводск, пр. Ленина, д. 21"
         ),
-        # Добавьте другие города по необходимости
     }
     for city, (court_name, court_address) in courts.items():
         if city.lower() in defendant_address.lower():
@@ -87,11 +86,7 @@ def insert_interest_table(doc, details):
     ]
     for i, paragraph in enumerate(doc.paragraphs):
         if '{interest_table}' in paragraph.text:
-            # Вставить таблицу после этого параграфа
             table = doc.add_table(rows=1, cols=len(headers))
-            # table.style = 'Table Grid'
-            # Стиль не критичен, убираем для совместимости
-            # Заголовки
             for col, header in enumerate(headers):
                 cell = table.cell(0, col)
                 cell.text = header
@@ -102,7 +97,6 @@ def insert_interest_table(doc, details):
                         run._element.rPr.rFonts.set(
                             qn('w:eastAsia'), 'Times New Roman'
                         )
-            # Данные
             for row in details:
                 cells = table.add_row().cells
                 cells[0].text = f"{row['sum']:,.2f}".replace(',', ' ')
@@ -120,10 +114,8 @@ def insert_interest_table(doc, details):
                             run._element.rPr.rFonts.set(
                                 qn('w:eastAsia'), 'Times New Roman'
                             )
-            # Вставить таблицу после параграфа
             p = paragraph._element
             p.addnext(table._element)
-            # Удалить маркер
             paragraph.text = paragraph.text.replace('{interest_table}', '')
             break
 
@@ -160,7 +152,7 @@ def format_header_paragraph(paragraph, label, value, postfix=None):
     paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
     if label:
         run_label = paragraph.add_run(label)
-        run_label.bold = False
+        run_label.bold = True
         run_label.font.name = 'Times New Roman'
         run_label.font.size = Pt(12)
     run_value = paragraph.add_run(value)
@@ -169,7 +161,7 @@ def format_header_paragraph(paragraph, label, value, postfix=None):
     run_value.font.size = Pt(12)
     if postfix:
         run_post = paragraph.add_run(postfix)
-        run_post.bold = False
+        run_post.bold = True
         run_post.font.name = 'Times New Roman'
         run_post.font.size = Pt(12)
 
@@ -183,8 +175,8 @@ def format_header_address(paragraph, value):
     run.font.size = Pt(12)
 
 
-def format_placeholder_paragraph(paragraph, placeholder, value):
-    text = paragraph.text
+def format_placeholder_paragraph(paragraph, placeholder, value, bold=False):
+    text = ''.join(run.text for run in paragraph.runs)
     idx = text.find(placeholder)
     if idx == -1:
         return
@@ -194,16 +186,16 @@ def format_placeholder_paragraph(paragraph, placeholder, value):
     paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
     if before:
         run_before = paragraph.add_run(before)
-        run_before.bold = False
+        run_before.bold = bold
         run_before.font.name = 'Times New Roman'
         run_before.font.size = Pt(12)
     run_value = paragraph.add_run(value)
-    run_value.bold = True
+    run_value.bold = bold
     run_value.font.name = 'Times New Roman'
     run_value.font.size = Pt(12)
     if after:
         run_after = paragraph.add_run(after)
-        run_after.bold = False
+        run_after.bold = bold
         run_after.font.name = 'Times New Roman'
         run_after.font.size = Pt(12)
 
@@ -218,35 +210,122 @@ def format_placeholder_paragraph_plain(paragraph, value):
 
 
 def replace_placeholders_robust(doc, replacements):
-    # Заменяет плейсхолдеры даже если они разбиты на несколько runs
-    def process_paragraph(paragraph):
+    """
+    Заменяет плейсхолдеры в документе, применяя жирное начертание только для указанных полей.
+    """
+    bold_placeholders = [
+        '{court_name}', '{plaintiff_name}', '{defendant_name}',
+        '{total_claim}', '{duty}'
+    ]
+
+    # Проверяем, является ли истец или ответчик ИП
+    is_plaintiff_ip = 'ИП' in str(replacements.get(
+        '{plaintiff_name}', '')) or 'Индивидуальный предприниматель' in str(replacements.get('{plaintiff_name}', ''))
+    is_defendant_ip = 'ИП' in str(replacements.get(
+        '{defendant_name}', '')) or 'Индивидуальный предприниматель' in str(replacements.get('{defendant_name}', ''))
+
+    for paragraph in doc.paragraphs:
         full_text = ''.join(run.text for run in paragraph.runs)
+
+        # Удаляем строки с КПП для ИП
+        if is_plaintiff_ip and 'КПП' in full_text and '{plaintiff_kpp}' in full_text:
+            # Удаляем только строку с КПП истца, а не весь параграф
+            lines = full_text.split('\n')
+            filtered_lines = []
+            for line in lines:
+                if not ('КПП' in line and '{plaintiff_kpp}' in line):
+                    filtered_lines.append(line)
+            full_text = '\n'.join(filtered_lines)
+
+        if is_defendant_ip and 'КПП' in full_text and '{defendant_kpp}' in full_text:
+            # Удаляем только строку с КПП ответчика, а не весь параграф
+            lines = full_text.split('\n')
+            filtered_lines = []
+            for line in lines:
+                if not ('КПП' in line and '{defendant_kpp}' in line):
+                    filtered_lines.append(line)
+            full_text = '\n'.join(filtered_lines)
+
         replaced = False
         for key, value in replacements.items():
             if key in full_text:
                 replaced = True
-                full_text = full_text.replace(key, str(value))
+                clean_value = str(value).replace(
+                    '\n', ' ').replace('\r', ' ').strip()
+                full_text = full_text.replace(key, clean_value)
         if replaced:
-            # Сохраняем стиль первого run для всего абзаца
-            if paragraph.runs:
-                style_run = deepcopy(paragraph.runs[0])
-            else:
-                style_run = None
             paragraph.clear()
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            # Проверяем, содержит ли параграф один из bold_placeholders
+            is_bold = any(
+                placeholder in full_text for placeholder in bold_placeholders)
             run = paragraph.add_run(full_text)
-            if style_run:
-                run.bold = style_run.bold
-                run.italic = style_run.italic
-                run.underline = style_run.underline
-                run.font.name = style_run.font.name
-                run.font.size = style_run.font.size
-    for paragraph in doc.paragraphs:
-        process_paragraph(paragraph)
+            run.bold = is_bold
+            run.font.name = 'Times New Roman'
+            run.font.size = Pt(12)
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
                 for paragraph in cell.paragraphs:
-                    process_paragraph(paragraph)
+                    full_text = ''.join(run.text for run in paragraph.runs)
+                    replaced = False
+                    for key, value in replacements.items():
+                        if key in full_text:
+                            replaced = True
+                            clean_value = str(value).replace(
+                                '\n', ' ').replace('\r', ' ').strip()
+                            full_text = full_text.replace(key, clean_value)
+                    if replaced:
+                        paragraph.clear()
+                        paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                        is_bold = any(
+                            placeholder in full_text for placeholder in bold_placeholders)
+                        run = paragraph.add_run(full_text)
+                        run.bold = is_bold
+                        run.font.name = 'Times New Roman'
+                        run.font.size = Pt(12)
+
+
+def replace_attachments_with_paragraphs(doc, attachments):
+    """
+    Заменяет плейсхолдер {attachments} списком приложений, каждое в отдельном параграфе
+    без нумерации, сохраняя статические приложения из шаблона.
+    """
+    idx = None
+    for i, paragraph in enumerate(doc.paragraphs):
+        if '{attachments}' in paragraph.text:
+            idx = i
+            break
+
+    if idx is not None:
+        # Удаляем параграф с плейсхолдером
+        p = doc.paragraphs[idx]._element
+        parent = p.getparent()
+        parent.remove(p)
+
+        # Добавляем заголовок "Приложения:"
+        new_par = doc.add_paragraph()
+        run = new_par.add_run("Приложения:")
+        run.font.name = 'Times New Roman'
+        run.font.size = Pt(12)
+        run.bold = True
+        new_par.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        parent.insert(idx, new_par._element)
+        idx += 1
+
+        # Добавляем динамические приложения без нумерации
+        for att in attachments:
+            # Удаляем точку с запятой и лишние пробелы
+            att_clean = att.rstrip(';').strip()
+            new_par = doc.add_paragraph()
+            run = new_par.add_run(f"{att_clean};")
+            run.font.name = 'Times New Roman'
+            run.font.size = Pt(12)
+            run.bold = False
+            new_par.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            parent.insert(idx, new_par._element)
+            idx += 1
+            logging.info(f"Добавлено динамическое приложение: {att_clean}")
 
 
 def create_isk_document(
@@ -256,9 +335,8 @@ def create_isk_document(
     replacements: dict
 ) -> str:
     doc = Document('template.docx')
-    # Универсальная замена плейсхолдеров, устойчивая к разбиению на runs
     replace_placeholders_robust(doc, replacements)
-    # Вставить таблицу процентов, если нужно
+    replace_attachments_with_paragraphs(doc, data.get('attachments', []))
     insert_interest_table(doc, interest_data['details'])
     result_docx = os.path.join(
         tempfile.gettempdir(), 'Исковое_заявление.docx'
@@ -352,8 +430,12 @@ async def finish_claim(update, context):
         )
         return
     claim_data = parse_claim_data(file_path)
-    print("INVOICES:", claim_data['invoices'])
-    print("UPDS:", claim_data['upds'])
+
+    # Извлекаем текст из документа для нового парсера
+    doc = Document(file_path)
+    text = "\n".join(p.text for p in doc.paragraphs)
+    document_blocks = parse_documents_with_sliding_window(text)
+
     claim_data['claim_number'] = context.user_data.get('claim_number', '')
     claim_data['claim_date'] = context.user_data.get('claim_date', '')
     key_rates = get_key_rates_from_395gk()
@@ -370,15 +452,38 @@ async def finish_claim(update, context):
     for key in ['claim_status', 'claim_date', 'claim_number', 'postal_receive_date']:
         if key not in context.user_data:
             context.user_data[key] = ''
-    postal_block = generate_postal_block(
-        claim_data.get('postal_numbers', []),
-        claim_data.get('postal_dates', [])
-    )
+
+    # Используем данные из нового парсера для истца и ответчика
+    plaintiff_name = document_blocks.get(
+        'plaintiff_name', claim_data['plaintiff']['name'].replace('\n', ' ').strip())
+    defendant_name = document_blocks.get(
+        'defendant_name', claim_data['defendant']['name'].replace('\n', ' ').strip())
+    contract_parties = document_blocks.get('contract_parties', '')
+    contract_parties_short = document_blocks.get('contract_parties_short', '')
+
+    # Проверяем, является ли истец ИП
+    is_plaintiff_ip = 'ИП' in plaintiff_name or 'Индивидуальный предприниматель' in plaintiff_name
+    is_defendant_ip = 'ИП' in defendant_name or 'Индивидуальный предприниматель' in defendant_name
+
+    # Форматируем имена для использования в тексте (короткие названия)
+    plaintiff_name_short = plaintiff_name
+    defendant_name_short = defendant_name
+
+    if 'Индивидуальный предприниматель' in plaintiff_name:
+        # Заменяем "Индивидуальный предприниматель Иванов И.И." на "ИП Иванов И.И."
+        plaintiff_name_short = plaintiff_name.replace(
+            'Индивидуальный предприниматель', 'ИП')
+
+    if 'Общество с ограниченной ответственностью' in defendant_name:
+        # Заменяем "Общество с ограниченной ответственностью" на "ООО"
+        defendant_name_short = defendant_name.replace(
+            'Общество с ограниченной ответственностью', 'ООО')
+
     replacements = {
         '{claim_paragraph}': generate_claim_paragraph(
             context.user_data
         ),
-        '{postal_block}': postal_block,
+        '{postal_block}': document_blocks.get('postal_block', ''),
         '{postal_numbers_all}': (
             ', '.join(claim_data.get('postal_numbers', []))
             or 'Не указано'
@@ -389,25 +494,28 @@ async def finish_claim(update, context):
         ),
         '{court_name}': get_court_by_address(claim_data['defendant']['address'])[0],
         '{court_address}': get_court_by_address(claim_data['defendant']['address'])[1],
-        '{plaintiff_name}': claim_data['plaintiff']['name'],
+        '{plaintiff_name}': plaintiff_name,
+        '{plaintiff_name_short}': plaintiff_name_short,
         '{plaintiff_inn}': claim_data['plaintiff']['inn'],
-        '{plaintiff_kpp}': claim_data['plaintiff']['kpp'],
+        '{plaintiff_kpp}': '' if is_plaintiff_ip else claim_data['plaintiff']['kpp'],
         '{plaintiff_ogrn}': claim_data['plaintiff']['ogrn'],
-        '{plaintiff_address}': claim_data['plaintiff']['address'],
-        '{defendant_name}': claim_data['defendant']['name'],
+        '{plaintiff_address}': claim_data['plaintiff']['address'].replace('\n', ' ').strip(),
+        '{defendant_name}': defendant_name,
+        '{defendant_name_short}': defendant_name_short,
         '{defendant_inn}': claim_data['defendant']['inn'],
-        '{defendant_kpp}': claim_data['defendant']['kpp'],
+        '{defendant_kpp}': '' if is_defendant_ip else claim_data['defendant']['kpp'],
         '{defendant_ogrn}': claim_data['defendant']['ogrn'],
-        '{defendant_address}': claim_data['defendant']['address'],
+        '{defendant_address}': claim_data['defendant']['address'].replace('\n', ' ').strip(),
+        '{contract_parties}': contract_parties,
+        '{contract_parties_short}': contract_parties_short,
         '{total_claim}': f"{total_claim:,.2f}".replace(',', ' '),
         '{duty}': f"{duty_data['duty']:,.0f}".replace(',', ' '),
         '{debt}': f"{claim_data['debt']:,.2f}".replace(',', ' '),
-        '{contracts}': ", ".join(claim_data['contracts'])
-        if claim_data['contracts'] else 'Не указано',
-        '{contract_applications}': claim_data['contract_applications'],
-        '{cargo_docs}': claim_data['cargo_documents'],
-        '{invoice_blocks}': claim_data['invoice_blocks'],
-        '{upd_blocks}': claim_data['upd_blocks'],
+        '{contracts}': document_blocks.get('contracts', ''),
+        '{contract_applications}': document_blocks.get('contract_applications', ''),
+        '{cargo_docs}': document_blocks.get('cargo_docs', ''),
+        '{invoice_blocks}': document_blocks.get('invoice_blocks', ''),
+        '{upd_blocks}': document_blocks.get('upd_blocks', ''),
         '{invoices}': ", ".join(claim_data['invoices'])
         if claim_data['invoices'] else 'Не указано',
         '{upds}': ", ".join(claim_data['upds'])
@@ -421,7 +529,8 @@ async def finish_claim(update, context):
                 ',', ' ')
         ),
         '{calculation_date}': datetime.today().strftime('%d.%m.%Y'),
-        '{signatory}': claim_data['signatory'],
+        '{signatory}': claim_data['signatory'].replace('\n', ' ').strip(),
+        '{signature_block}': claim_data.get('signature_block', 'Не указано'),
         '{postal_numbers}': (
             context.user_data.get('claim_number', '') or 'Не указано'
         ),
@@ -430,10 +539,6 @@ async def finish_claim(update, context):
         ),
         '{payment_days}': claim_data.get('payment_days', 'Не указано'),
     }
-    # Удаляем переносы строк и невидимые символы из всех строковых значений replacements
-    for k, v in replacements.items():
-        if isinstance(v, str):
-            replacements[k] = v.replace('\n', '').replace('\u2028', '').strip()
     result_docx = create_isk_document(
         claim_data, interest_data, duty_data, replacements
     )
@@ -449,8 +554,6 @@ async def finish_claim(update, context):
         logging.warning(
             f"Не удалось удалить файл {file_path}: {e}"
         )
-
-# --- Перехват загрузки файла и запуск диалога ---
 
 
 async def handle_doc_entry(update, context):
@@ -503,7 +606,7 @@ async def handle_doc_entry(update, context):
                 f'Ошибка обработки: {e}. Проверьте формат файла.'
             )
 
-# --- ConversationHandler ---
+
 conv_handler = ConversationHandler(
     entry_points=[MessageHandler(filters.Document.ALL, handle_doc_entry)],
     states={
@@ -517,8 +620,6 @@ conv_handler = ConversationHandler(
 
 
 def generate_postal_block(postal_numbers, postal_dates):
-    print("DEBUG postal_numbers:", postal_numbers)
-    print("DEBUG postal_dates:", postal_dates)
     if not postal_numbers or not postal_dates or len(postal_numbers) != len(postal_dates):
         return "Не указано"
     if len(postal_numbers) == 1:
@@ -541,7 +642,8 @@ def main() -> None:
     logging.info("Starting bot...")
     if TOKEN is None:
         logging.error(
-            "TOKEN is not set. Please provide a valid Telegram bot token.")
+            "TOKEN is not set. Please provide a valid Telegram bot token."
+        )
         raise ValueError(
             "TOKEN is not set. Please provide a valid Telegram bot token.")
     app = Application.builder().token(TOKEN).build()
