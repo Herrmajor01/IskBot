@@ -89,7 +89,9 @@ def parse_periods_from_docx(
                     current_sum = float(amount_text.replace(',', '.'))
                     logging.debug(f"Установлена сумма: {current_sum}")
             except ValueError as e:
-                logging.debug(f"Ошибка конвертации суммы '{amount_text}': {e}")
+                logging.debug(
+                    f"Ошибка конвертации суммы '{amount_text}': {e}"
+                )
                 continue
             date_from_text = cells[1].text.strip()
             date_to_text = cells[2].text.strip()
@@ -315,14 +317,20 @@ def parse_claim_data(docx_path: str) -> Dict[str, Any]:
     defendant_block = None
     plaintiff_block = None
 
-    # Ищем блок ответчика (начинается с "Обществу с ограниченной ответственностью" и т.д.)
-    defendant_pattern = r'(Обществу с ограниченной ответственностью[^]*?)(?=\n\n|\nот|\nТРЕБОВАНИЕ|\nПРЕТЕНЗИЯ)'
+    # Ищем блок ответчика (начинается с "Обществу с ограниченной ответственностью")
+    defendant_pattern = (
+        r'(Обществу с ограниченной ответственностью.*?)'
+        r'(?=\n\n|\nот|\nТРЕБОВАНИЕ|\nПРЕТЕНЗИЯ)'
+    )
     defendant_match = re.search(defendant_pattern, text, re.DOTALL)
     if defendant_match:
         defendant_block = defendant_match.group(1).strip()
 
-    # Ищем блок истца (начинается с "от Индивидуального предпринимателя" и т.д.)
-    plaintiff_pattern = r'(от Индивидуального предпринимателя[^]*?)(?=\n\n|\nТРЕБОВАНИЕ|\nПРЕТЕНЗИЯ)'
+    # Ищем блок истца (начинается с "от Индивидуального предпринимателя")
+    plaintiff_pattern = (
+        r'(от Индивидуального предпринимателя.*?)'
+        r'(?=\n\n|\nТРЕБОВАНИЕ|\nПРЕТЕНЗИЯ)'
+    )
     plaintiff_match = re.search(plaintiff_pattern, text, re.DOTALL)
     if plaintiff_match:
         plaintiff_block = plaintiff_match.group(1).strip()
