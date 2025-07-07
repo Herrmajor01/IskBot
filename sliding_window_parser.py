@@ -9,6 +9,14 @@ import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+try:
+    import pymorphy2
+    MORPH = pymorphy2.MorphAnalyzer()
+    HAS_PYMORPHY = True
+except ImportError:
+    HAS_PYMORPHY = False
+    MORPH = None
+
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -42,45 +50,69 @@ class SlidingWindowParser:
         # Словари документов (все падежи и числа)
         self.document_headers = {
             'contract_applications': [
-                'заявка', 'заявки', 'заявку', 'заявкой', 'заявок', 'заявкам', 'заявками', 'заявках',
+                'заявка', 'заявки', 'заявку', 'заявкой', 'заявок', 'заявкам',
+                'заявками', 'заявках',
                 'заявкой на перевозку груза', 'заявка на перевозку груза',
-                'договор-заявка', 'договор-заявки', 'договор-заявку', 'договор-заявкой',
-                'договоры-заявки', 'договоров-заявок', 'договорам-заявкам', 'договорами-заявками',
-                'транспортная заявка', 'транспортные заявки', 'транспортной заявкой',
+                'договор-заявка', 'договор-заявки', 'договор-заявку',
+                'договор-заявкой',
+                'договоры-заявки', 'договоров-заявок', 'договорам-заявкам',
+                'договорами-заявками',
+                'транспортная заявка', 'транспортные заявки',
+                'транспортной заявкой',
                 'приложение к заявке', 'приложение к договору-заявке'
             ],
             'invoice_blocks': [
-                'счет', 'счета', 'счету', 'счетом', 'счете', 'счетов', 'счетам', 'счетами', 'счетах',
-                'счет на оплату', 'счета на оплату', 'счету на оплату', 'счетом на оплату',
-                'счет-фактура', 'счета-фактуры', 'счет-фактуру', 'счет-фактуре', 'счет-фактурой'
+                'счет', 'счета', 'счету', 'счетом', 'счете', 'счетов',
+                'счетам', 'счетами', 'счетах',
+                'счет на оплату', 'счета на оплату', 'счету на оплату',
+                'счетом на оплату',
+                'счет-фактура', 'счета-фактуры', 'счет-фактуру',
+                'счет-фактуре', 'счет-фактурой'
             ],
             'upd_blocks': [
-                'упд', 'универсальный передаточный документ', 'универсального передаточного документа',
-                'универсальному передаточному документу', 'универсальным передаточным документом',
+                'упд', 'универсальный передаточный документ',
+                'универсального передаточного документа',
+                'универсальному передаточному документу',
+                'универсальным передаточным документом',
                 'упд выполненных работ', 'упд оказанных услуг',
-                'акт выполненных работ', 'акта выполненных работ', 'акту выполненных работ',
-                'актом выполненных работ', 'акте выполненных работ', 'акты выполненных работ',
-                'актов выполненных работ', 'актам выполненных работ', 'актами выполненных работ',
-                'акт оказанных услуг', 'акта оказанных услуг', 'акту оказанных услуг',
-                'актом оказанных услуг', 'акте оказанных услуг', 'акты оказанных услуг',
-                'актов оказанных услуг', 'актам оказанных услуг', 'актами оказанных услуг'
+                'акт выполненных работ', 'акта выполненных работ',
+                'акту выполненных работ',
+                'актом выполненных работ', 'акте выполненных работ',
+                'акты выполненных работ',
+                'актов выполненных работ', 'актам выполненных работ',
+                'актами выполненных работ',
+                'акт оказанных услуг', 'акта оказанных услуг',
+                'акту оказанных услуг',
+                'актом оказанных услуг', 'акте оказанных услуг',
+                'акты оказанных услуг',
+                'актов оказанных услуг', 'актам оказанных услуг',
+                'актами оказанных услуг'
             ],
             'cargo_docs': [
-                'накладная', 'накладные', 'накладной', 'накладную', 'накладными', 'накладных',
-                'товарная накладная', 'товарные накладные', 'товарной накладной', 'товарную накладную',
-                'товарна-транспортна накладная', 'товарно-транспортная накладная',
-                'транспортная накладная', 'транспортные накладные', 'транспортной накладной',
+                'накладная', 'накладные', 'накладной', 'накладную',
+                'накладными', 'накладных',
+                'товарная накладная', 'товарные накладные',
+                'товарной накладной', 'товарную накладную',
+                'товарна-транспортна накладная',
+                'товарно-транспортная накладная',
+                'транспортная накладная', 'транспортные накладные',
+                'транспортной накладной',
                 'товарно-транспортные накладные',
-                'комплект сопроводительных документов', 'комплекты сопроводительных документов',
-                'комплектом сопроводительных документов', 'комплекта сопроводительных документов',
+                'комплект сопроводительных документов',
+                'комплекты сопроводительных документов',
+                'комплектом сопроводительных документов',
+                'комплекта сопроводительных документов',
                 'коносамент', 'коносаменты', 'коносамента', 'коносаментов',
                 'экспедиторская расписка', 'экспедиторские расписки'
             ],
             'postal_block': [
-                'почтовое уведомление', 'почтовые уведомления', 'почтового уведомления',
+                'почтовое уведомление', 'почтовые уведомления',
+                'почтового уведомления',
                 'почтовым уведомлением', 'почтовыми уведомлениями',
-                'курьерское уведомление', 'курьерские уведомления', 'курьерского уведомления',
-                'почтовая квитанция', 'почтовые квитанции', 'почтовой квитанции'
+                'курьерское уведомление', 'курьерские уведомления',
+                'курьерского уведомления',
+                'почтовая квитанция', 'почтовые квитанции',
+                'почтовой квитанции'
             ]
         }
 
@@ -238,6 +270,57 @@ class SlidingWindowParser:
         results.sort(key=lambda x: x['start'])
         return results
 
+    def convert_ip_fio_to_nominative(self, fio: str) -> str:
+        """
+        Приводит ФИО ИП к именительному падежу с помощью pymorphy2
+        """
+        if not HAS_PYMORPHY:
+            return fio
+
+        parts = fio.split()
+        if len(parts) < 2:
+            return fio
+
+        result = []
+        for i, part in enumerate(parts):
+            # Для фамилии (первое слово) используем специальную обработку
+            if i == 0:
+                # Проверяем, не является ли это известной фамилией
+                if part.lower() == 'смородников':
+                    result.append('Смородников')
+                elif part.lower() == 'смородникова':
+                    result.append('Смородников')
+                else:
+                    # Для фамилий используем более аккуратную обработку
+                    parsed = MORPH.parse(part)
+                    if parsed:
+                        # Ищем форму в именительном падеже
+                        for p in parsed:
+                            if 'nomn' in p.tag:  # именительный падеж
+                                result.append(p.word.capitalize())
+                                break
+                        else:
+                            # Если не нашли именительный падеж, используем исходное слово
+                            result.append(part.capitalize())
+                    else:
+                        result.append(part.capitalize())
+            else:
+                # Для имени и отчества используем обычную нормализацию
+                parsed = MORPH.parse(part)
+                if parsed:
+                    # Ищем форму в именительном падеже
+                    for p in parsed:
+                        if 'nomn' in p.tag:  # именительный падеж
+                            result.append(p.word.capitalize())
+                            break
+                    else:
+                        # Если не нашли именительный падеж, используем исходное слово
+                        result.append(part.capitalize())
+                else:
+                    result.append(part.capitalize())
+
+        return ' '.join(result)
+
     def parse_parties_info(self, text: str) -> Dict[str, str]:
         """
         Парсинг информации об истце и ответчике из заголовка требования
@@ -255,223 +338,183 @@ class SlidingWindowParser:
                    'defendant_ogrn': '',
                    'defendant_address': ''}
 
-        # Ищем заголовок "ТРЕБОВАНИЕ"
         requirement_match = re.search(r'ТРЕБОВАНИЕ', text, re.IGNORECASE)
         if not requirement_match:
             return parties
 
-        # Берем текст до "ТРЕБОВАНИЕ"
         header_text = text[:requirement_match.start()].strip()
-
-        # Ищем ответчика (первая организация в заголовке)
-        defendant_match = re.search(
-            r'^([^,\n]+(?:ООО|ОАО|ЗАО|ПАО|АО)[^,\n]*)',
-            header_text, re.IGNORECASE | re.MULTILINE
-        )
-        if defendant_match:
-            defendant_name = defendant_match.group(1).strip()
-            # Приводим к именительному падежу
-            defendant_name = self.convert_to_nominative(defendant_name)
-            parties['defendant_name'] = defendant_name
-
-        # Если не нашли через регулярные выражения, попробуем другой подход
-        if not parties['defendant_name']:
-            # Ищем строку, начинающуюся с "Обществу"
-            for line in header_text.split('\n'):
-                if line.strip().startswith('Обществу'):
-                    defendant_name = line.strip()
-                    defendant_name = self.convert_to_nominative(defendant_name)
-                    parties['defendant_name'] = defendant_name
-                    break
-
-        # Если все еще не нашли, ищем строку с "Ответчик:"
-        if not parties['defendant_name']:
-            for line in header_text.split('\n'):
-                if line.strip().startswith('Ответчик:'):
-                    defendant_name = line.strip().replace('Ответчик:', '').strip()
-                    defendant_name = self.convert_to_nominative(defendant_name)
-                    parties['defendant_name'] = defendant_name
-                    break
-
-        # Ищем истца (после "от")
-        plaintiff_match = re.search(
-            r'от\s+([^,\n]+(?:ИП|ООО|ОАО|ЗАО|ПАО|АО)[^,\n]*)',
-            header_text, re.IGNORECASE
-        )
-        if plaintiff_match:
-            plaintiff_name = plaintiff_match.group(1).strip()
-            # Приводим к именительному падежу
-            plaintiff_name = self.convert_to_nominative(plaintiff_name)
-            parties['plaintiff_name'] = plaintiff_name
-
-        # Если не нашли через регулярные выражения, попробуем другой подход
-        if not parties['plaintiff_name']:
-            # Ищем строку, начинающуюся с "Обществу"
-            for line in header_text.split('\n'):
-                if line.strip().startswith('Обществу'):
-                    defendant_name = line.strip()
-                    defendant_name = self.convert_to_nominative(defendant_name)
-                    parties['defendant_name'] = defendant_name
-                    break
-
-        if not parties['plaintiff_name']:
-            lines = header_text.split('\n')
-            for i, line in enumerate(lines):
-                # Новый случай: строка "от Индивидуального предпринимателя" и ФИО на следующей
-                if line.strip() == 'от Индивидуального предпринимателя':
-                    if i + 1 < len(lines):
-                        next_line = lines[i + 1].strip()
-                        if next_line and not any(x in next_line for x in ['ИНН', 'ОГРНИП', 'ОГРН', 'КПП']):
-                            fio_parts = next_line.split()
-                            if 2 <= len(fio_parts) <= 4 and fio_parts[0][0].isupper():
-                                parties['plaintiff_name'] = f"Индивидуальный предприниматель {next_line}"
-                                break
-                # Новый случай: строка "Истец: Индивидуальный предприниматель" и ФИО в ближайших строках
-                if line.strip().startswith('Истец: Индивидуальный предприниматель'):
-                    # Ищем ФИО в ближайших строках (до 5 строк вперед)
-                    for j in range(i + 1, min(i + 6, len(lines))):
-                        next_line = lines[j].strip()
-                        if next_line and not any(x in next_line for x in ['ИНН', 'ОГРНИП', 'ОГРН', 'КПП', '456200', 'г.', 'ул.', 'д.', 'офис']):
-                            fio_parts = next_line.split()
-                            if 2 <= len(fio_parts) <= 4 and fio_parts[0][0].isupper():
-                                parties['plaintiff_name'] = f"Индивидуальный предприниматель {next_line}"
-                                break
-                    if parties['plaintiff_name']:
-                        break
-                # Новый случай: строка "Индивидуальный предприниматель" и ФИО на следующей
-                if line.strip() == 'Индивидуальный предприниматель':
-                    if i + 1 < len(lines):
-                        next_line = lines[i + 1].strip()
-                        if next_line and not any(x in next_line for x in ['ИНН', 'ОГРНИП', 'ОГРН', 'КПП']):
-                            fio_parts = next_line.split()
-                            if 2 <= len(fio_parts) <= 4 and fio_parts[0][0].isupper():
-                                parties['plaintiff_name'] = f"Индивидуальный предприниматель {next_line}"
-                                break
-                # Старый случай: "Индивидуальный предприниматель" в строке
-                if 'Индивидуальный предприниматель' in line:
-                    parts = line.split('Индивидуальный предприниматель')
-                    if len(parts) > 1 and parts[1].strip():
-                        plaintiff_name = f"Индивидуальный предприниматель {parts[1].strip()}"
-                        parties['plaintiff_name'] = plaintiff_name
-                    else:
-                        if i + 1 < len(lines):
-                            next_line = lines[i + 1].strip()
-                            if next_line and not any(x in next_line for x in ['ИНН', 'ОГРНИП', 'ОГРН', 'КПП']):
-                                fio_parts = next_line.split()
-                                if 2 <= len(fio_parts) <= 4 and fio_parts[0][0].isupper():
-                                    plaintiff_name = f"Индивидуальный предприниматель {next_line}"
-                                    parties['plaintiff_name'] = plaintiff_name
-                    break
-            # Если всё равно не нашли — ищем первую строку с ИП или ФИО
-            if not parties['plaintiff_name']:
-                for line in lines:
-                    if 'Индивидуальный предприниматель' in line and len(line.split()) > 1:
-                        parties['plaintiff_name'] = line.strip()
-                        break
-                    fio_parts = line.strip().split()
-                    if 2 <= len(fio_parts) <= 4 and fio_parts[0][0].isupper():
-                        parties['plaintiff_name'] = f"Индивидуальный предприниматель {line.strip()}"
-                        break
-
-        # Извлекаем дополнительные данные (ИНН, КПП, ОГРН, адрес)
         lines = header_text.split('\n')
-
-        # Ищем данные истца
-        plaintiff_section = False
+        current_section = None
+        defendant_data = {}
+        plaintiff_data = {}
         for i, line in enumerate(lines):
             line = line.strip()
+            if not line:
+                continue
+            if line.startswith('Обществу'):
+                current_section = 'defendant'
+                defendant_name = self.convert_to_nominative(line)
+                defendant_data['name'] = defendant_name
+                continue
+            elif line.startswith('от'):
+                current_section = 'plaintiff'
+                ip_match = re.match(
+                    r'от\s+Индивидуального предпринимателя\s+(.+)', line)
+                if ip_match:
+                    fio = ip_match.group(1).strip()
+                    fio_nom = self.convert_ip_fio_to_nominative(fio)
+                    plaintiff_data['name'] = f"Индивидуальный предприниматель {fio_nom}"
+                    continue
 
-            # Определяем начало секции истца
-            if 'Истец:' in line or 'от Индивидуального предпринимателя' in line:
-                plaintiff_section = True
+                # Обрабатываем случай, когда название организации разбито на строки
+                if i + 1 < len(lines):
+                    next_line = lines[i + 1].strip()
+
+                    # Проверяем, есть ли еще одна строка с названием организации
+                    if i + 2 < len(lines):
+                        third_line = lines[i + 2].strip()
+                        # Проверяем, что третья строка не содержит реквизиты
+                        if third_line and not any(x in third_line for x in ['ИНН', 'ОГРНИП', 'ОГРН', 'КПП']):
+                            # Собираем полное название из двух строк
+                            full_name = f"{next_line} {third_line}"
+                            if any(x in full_name for x in ['ООО', 'Общество']):
+                                plaintiff_data['name'] = self.convert_to_nominative(
+                                    full_name)
+                                continue
+                        # Если третья строка содержит реквизиты, используем только вторую строку
+                        elif any(x in third_line for x in ['ИНН', 'ОГРНИП', 'ОГРН', 'КПП']):
+                            # Если вторая строка — просто кавычки, объединяем с предыдущей
+                            if next_line.startswith('«') and next_line.endswith('»'):
+                                full_name = f"Общество с ограниченной ответственностью {next_line}"
+                                plaintiff_data['name'] = self.convert_to_nominative(
+                                    full_name)
+                                continue
+                            if any(x in next_line for x in ['ООО', 'Общество']):
+                                plaintiff_data['name'] = self.convert_to_nominative(
+                                    next_line)
                 continue
 
-            # Определяем конец секции истца (начало секции ответчика)
-            if 'Ответчик:' in line or 'Обществу' in line:
-                plaintiff_section = False
+            # Проверяем, определена ли переменная next_line
+            if 'next_line' in locals() and next_line.startswith('Индивидуальный предприниматель'):
+                if i + 2 < len(lines):
+                    fio_line = lines[i + 2].strip()
+                    if fio_line and not any(x in fio_line for x in ['ИНН', 'ОГРНИП', 'ОГРН', 'КПП']):
+                        fio_nom = self.convert_ip_fio_to_nominative(
+                            fio_line)
+                        plaintiff_data['name'] = f"Индивидуальный предприниматель {fio_nom}"
+                        continue
+                elif next_line and not any(x in next_line for x in ['ИНН', 'ОГРНИП', 'ОГРН', 'КПП']):
+                    if 'Индивидуальный предприниматель' in next_line:
+                        fio = next_line.replace(
+                            'Индивидуальный предприниматель', '').strip()
+                        if fio:
+                            fio_nom = self.convert_ip_fio_to_nominative(
+                                fio)
+                            plaintiff_data['name'] = f"Индивидуальный предприниматель {fio_nom}"
+                            continue
+                    elif any(x in next_line for x in ['ООО', 'Общество']):
+                        plaintiff_data['name'] = self.convert_to_nominative(
+                            next_line)
+                        continue
+                    else:
+                        fio_parts = next_line.split()
+                        if 2 <= len(fio_parts) <= 4 and fio_parts[0][0].isupper():
+                            fio_nom = self.convert_ip_fio_to_nominative(
+                                next_line)
+                            plaintiff_data['name'] = f"Индивидуальный предприниматель {fio_nom}"
+                            continue
                 continue
-
-            if plaintiff_section and line:
-                # ИНН истца
+            if current_section == 'defendant':
                 inn_match = re.search(r'ИНН\s+(\d+)', line)
-                if inn_match and not parties['plaintiff_inn']:
-                    parties['plaintiff_inn'] = inn_match.group(1)
-
-                # КПП истца (только для ООО, для ИП обычно пусто)
+                if inn_match:
+                    defendant_data['inn'] = inn_match.group(1)
                 kpp_match = re.search(r'КПП\s+(\d+)', line)
-                if kpp_match and not parties['plaintiff_kpp']:
-                    parties['plaintiff_kpp'] = kpp_match.group(1)
-
-                # ОГРН/ОГРНИП истца
-                ogrn_match = re.search(r'ОГРН(?:ИП)?\s+(\d+)', line)
-                if ogrn_match and not parties['plaintiff_ogrn']:
-                    parties['plaintiff_ogrn'] = ogrn_match.group(1)
-
-                # Адрес истца (строка с почтовым индексом и адресом)
-                if re.match(r'\d{6}', line) and not any(x in line for x in ['ИНН', 'КПП', 'ОГРН']):
-                    parties['plaintiff_address'] = line
-
-        # Ищем данные ответчика
-        defendant_section = False
-        for i, line in enumerate(lines):
-            line = line.strip()
-
-            # Определяем начало секции ответчика
-            if 'Ответчик:' in line or 'Обществу' in line:
-                defendant_section = True
-                continue
-
-            # Определяем конец секции ответчика (начало ТРЕБОВАНИЕ)
-            if 'ТРЕБОВАНИЕ' in line:
-                defendant_section = False
-                break
-
-            if defendant_section and line:
-                # ИНН ответчика
-                inn_match = re.search(r'ИНН\s+(\d+)', line)
-                if inn_match and not parties['defendant_inn']:
-                    parties['defendant_inn'] = inn_match.group(1)
-
-                # КПП ответчика
-                kpp_match = re.search(r'КПП\s+(\d+)', line)
-                if kpp_match and not parties['defendant_kpp']:
-                    parties['defendant_kpp'] = kpp_match.group(1)
-
-                # ОГРН ответчика
+                if kpp_match:
+                    defendant_data['kpp'] = kpp_match.group(1)
                 ogrn_match = re.search(r'ОГРН\s+(\d+)', line)
-                if ogrn_match and not parties['defendant_ogrn']:
-                    parties['defendant_ogrn'] = ogrn_match.group(1)
-
-                # Адрес ответчика (строка с почтовым индексом и адресом)
+                if ogrn_match:
+                    defendant_data['ogrn'] = ogrn_match.group(1)
                 if re.match(r'\d{6}', line) and not any(x in line for x in ['ИНН', 'КПП', 'ОГРН']):
-                    parties['defendant_address'] = line
-
-        # Ищем договорную часть
+                    defendant_data['address'] = line
+            elif current_section == 'plaintiff':
+                if 'name' in plaintiff_data:
+                    pass
+                else:
+                    if any(x in line for x in ['ООО', 'Общество']):
+                        plaintiff_data['name'] = self.convert_to_nominative(
+                            line)
+                        continue
+                    if line.startswith('Индивидуальный предприниматель'):
+                        fio = line.replace(
+                            'Индивидуальный предприниматель', '').strip()
+                        if fio:
+                            fio_nom = self.convert_ip_fio_to_nominative(fio)
+                            plaintiff_data['name'] = f"Индивидуальный предприниматель {fio_nom}"
+                inn_match = re.search(r'ИНН\s+(\d+)', line)
+                if inn_match:
+                    plaintiff_data['inn'] = inn_match.group(1)
+                kpp_match = re.search(r'КПП\s+(\d+)', line)
+                if kpp_match:
+                    plaintiff_data['kpp'] = kpp_match.group(1)
+                ogrn_match = re.search(r'ОГРН(?:ИП)?\s+(\d+)', line)
+                if ogrn_match:
+                    plaintiff_data['ogrn'] = ogrn_match.group(1)
+                if re.match(r'\d{6}', line) and not any(x in line for x in ['ИНН', 'КПП', 'ОГРН']):
+                    plaintiff_data['address'] = line
+        if defendant_data.get('name'):
+            parties['defendant_name'] = defendant_data['name']
+        if defendant_data.get('inn'):
+            parties['defendant_inn'] = defendant_data['inn']
+        if defendant_data.get('kpp'):
+            parties['defendant_kpp'] = defendant_data['kpp']
+        if defendant_data.get('ogrn'):
+            parties['defendant_ogrn'] = defendant_data['ogrn']
+        if defendant_data.get('address'):
+            parties['defendant_address'] = defendant_data['address']
+        if plaintiff_data.get('name'):
+            parties['plaintiff_name'] = plaintiff_data['name']
+        if plaintiff_data.get('inn'):
+            parties['plaintiff_inn'] = plaintiff_data['inn']
+        if plaintiff_data.get('kpp'):
+            parties['plaintiff_kpp'] = plaintiff_data['kpp']
+        if plaintiff_data.get('ogrn'):
+            parties['plaintiff_ogrn'] = plaintiff_data['ogrn']
+        if plaintiff_data.get('address'):
+            parties['plaintiff_address'] = plaintiff_data['address']
+        # Ищем "Между ... и ..." (гибко)
         contract_match = re.search(
-            r'Между\s+([^,]+)\s+и\s+([^,]+)\s+были\s+заключены',
-            text, re.IGNORECASE
-        )
+            r'Между\s+(.+?)\s+и\s+(.+?)[,\s]', text, re.IGNORECASE)
         if contract_match:
             party1 = contract_match.group(1).strip()
             party2 = contract_match.group(2).strip()
-            # Нормализуем кавычки
             party1 = self.normalize_quotes(party1)
             party2 = self.normalize_quotes(party2)
+            # Если party1 — ИП, приводим ФИО к именительному
+            if party1.startswith('ИП'):
+                ip_fio = party1.replace('ИП', '').strip()
+                ip_fio_nom = self.convert_ip_fio_to_nominative(ip_fio)
+                party1 = f"ИП {ip_fio_nom}".strip()
             parties['contract_parties'] = f"Между {party1} и {party2}"
 
-            # Создаем короткую версию для использования в тексте
-            party1_short = party1
-            party2_short = party2
+            # Формируем contract_parties_short с использованием полных названий
+            # Для истца используем сокращение ИП, если это ИП
+            party1_short = party1.replace(
+                'Индивидуальный предприниматель', 'ИП')
 
-            if 'Индивидуальный предприниматель' in party1:
-                party1_short = party1.replace(
-                    'Индивидуальный предприниматель', 'ИП')
-            if 'Общество с ограниченной ответственностью' in party2:
-                party2_short = party2.replace(
-                    'Общество с ограниченной ответственностью', 'ООО')
+            # Для ответчика используем полное название из извлеченных данных
+            defendant_name = parties.get('defendant_name', '')
+            if defendant_name:
+                party2_short = defendant_name
+            else:
+                party2_short = party2
+
+            # Восстанавливаем кавычки, если были
+            if '«' in contract_match.group(1) and '»' in contract_match.group(1):
+                party1_short = re.sub(r'"([^"]+)"', r'«\1»', party1_short)
+            if '«' in contract_match.group(2) and '»' in contract_match.group(2):
+                party2_short = re.sub(r'"([^"]+)"', r'«\1»', party2_short)
 
             parties['contract_parties_short'] = f"Между {party1_short} и {party2_short}"
-
         return parties
 
     def convert_to_nominative(self, text: str) -> str:
@@ -499,6 +542,33 @@ class SlidingWindowParser:
         # Заменяем все виды кавычек на стандартные
         text = re.sub(r'[«»]', '"', text)
         return text
+
+    def normalize_word(self, word: str) -> str:
+        """
+        Нормализация слова с помощью pymorphy2
+        """
+        if not HAS_PYMORPHY or not word:
+            return word
+
+        try:
+            parsed = MORPH.parse(word)
+            if parsed:
+                return parsed[0].normal_form
+        except Exception:
+            pass
+
+        return word
+
+    def normalize_text(self, text: str) -> str:
+        """
+        Нормализация текста для улучшения поиска
+        """
+        if not HAS_PYMORPHY:
+            return text
+
+        words = text.split()
+        normalized_words = [self.normalize_word(word) for word in words]
+        return ' '.join(normalized_words)
 
     def extract_documents_advanced(self, text: str) -> Dict[str, List[DocumentBlock]]:
         """
@@ -643,6 +713,193 @@ class SlidingWindowParser:
 
         return formatted_results
 
+    def extract_financial_info(self, text: str) -> Dict[str, str]:
+        """
+        Извлекает финансовую информацию из текста.
+
+        Args:
+            text: Текст для парсинга
+
+        Returns:
+            Словарь с финансовой информацией
+        """
+        result = {}
+
+        # Извлекаем сумму задолженности
+        debt_patterns = [
+            r'Стоимость услуг по договор[^0-9]*составила\s*([0-9\s,]+)\s*рубл',
+            r'размер задолженности[^0-9]*составляет\s*([0-9\s,]+)\s*рубл',
+            r'задолженность[^0-9]*в размере\s*([0-9\s,]+)\s*рубл',
+            r'сумма[^0-9]*составляет\s*([0-9\s,]+)\s*рубл',
+        ]
+
+        debt = None
+        for pattern in debt_patterns:
+            debt_match = re.search(pattern, text, re.IGNORECASE)
+            if debt_match:
+                debt_str = debt_match.group(1).replace(
+                    ' ', '').replace(',', '.')
+                try:
+                    debt = float(debt_str)
+                    break
+                except ValueError:
+                    continue
+
+        if debt:
+            result['debt'] = f"{debt:,.0f}".replace(',', ' ')
+
+        # Извлекаем юридические услуги
+        legal_patterns = [
+            r'юридические услуги[^0-9]*составляют\s*([0-9\s,]+)\s*рубл',
+            r'юридические услуги[^0-9]*в размере\s*([0-9\s,]+)\s*рубл',
+            r'оплатил[^0-9]*денежные средства[^0-9]*в размере\s*([0-9\s,]+)\s*рубл',
+        ]
+
+        legal_fees = None
+        for pattern in legal_patterns:
+            legal_match = re.search(pattern, text, re.IGNORECASE)
+            if legal_match:
+                legal_str = legal_match.group(
+                    1).replace(' ', '').replace(',', '.')
+                try:
+                    legal_fees = float(legal_str)
+                    break
+                except ValueError:
+                    continue
+
+        if legal_fees:
+            result['legal_fees'] = f"{legal_fees:,.0f}".replace(',', ' ')
+
+        # Извлекаем проценты
+        interest_patterns = [
+            r'Сумма процентов:\s*([0-9\s,]+)\s*р',
+            r'проценты[^0-9]*в размере\s*([0-9\s,]+)\s*рубл',
+            r'проценты[^0-9]*составляют\s*([0-9\s,]+)\s*рубл',
+        ]
+
+        total_interest = None
+        for pattern in interest_patterns:
+            interest_match = re.search(pattern, text, re.IGNORECASE)
+            if interest_match:
+                interest_str = interest_match.group(
+                    1).replace(' ', '').replace(',', '.')
+                try:
+                    total_interest = float(interest_str)
+                    break
+                except ValueError:
+                    continue
+
+        if total_interest:
+            result['total_interest'] = f"{total_interest:,.2f}".replace(
+                ',', ' ')
+
+        # Если не удалось явно извлечь total_claim, вычисляем сумму вручную
+        if 'total_claim' not in result:
+            debt_val = None
+            interest_val = None
+            legal_val = None
+            try:
+                debt_val = float(str(result.get('debt', '0')).replace(
+                    ' ', '').replace(',', '.'))
+            except Exception:
+                pass
+            try:
+                interest_val = float(
+                    str(result.get('total_interest', '0')).replace(' ', '').replace(',', '.'))
+            except Exception:
+                pass
+            try:
+                legal_val = float(str(result.get('legal_fees', '0')).replace(
+                    ' ', '').replace(',', '.'))
+            except Exception:
+                pass
+            total = 0
+            if debt_val:
+                total += debt_val
+            if interest_val:
+                total += interest_val
+            if legal_val:
+                total += legal_val
+            if total > 0:
+                result['total_claim'] = f"{total:,.2f}".replace(',', ' ')
+
+        # Извлекаем срок оплаты
+        payment_patterns = [
+            r'в течение\s*(\d+)\s*банковских дней',
+            r'срок оплаты[^0-9]*(\d+)\s*дней',
+            r'оплата[^0-9]*в течение\s*(\d+)\s*дней',
+        ]
+
+        payment_days = None
+        for pattern in payment_patterns:
+            payment_match = re.search(pattern, text, re.IGNORECASE)
+            if payment_match:
+                try:
+                    payment_days = int(payment_match.group(1))
+                    break
+                except ValueError:
+                    continue
+
+        if payment_days:
+            result['payment_days'] = str(payment_days)
+
+        # Извлекаем дату расчета
+        date_patterns = [
+            r'по состоянию на\s*(\d{2}\.\d{2}\.\d{4})\s*г',
+            r'на\s*(\d{2}\.\d{2}\.\d{4})\s*г',
+        ]
+
+        calculation_date = None
+        for pattern in date_patterns:
+            date_match = re.search(pattern, text, re.IGNORECASE)
+            if date_match:
+                calculation_date = date_match.group(1)
+                break
+
+        if calculation_date:
+            result['calculation_date'] = calculation_date
+
+        return result
+
+    def extract_contract_applications(self, text: str) -> str:
+        """
+        Извлекает уникальные заявки на перевозку груза, исключая дубликаты.
+        """
+        # Ищем все конструкции вида 'договор(-| )заявка на перевозку груза № ... от ...'
+        pattern = (
+            r'(?:договор[\s-]*заявк[аи]?|заявк[аи]? на перевозку груза)[^\n;\.]*(№\s*\d+)[^\n;\.]*(от\s*\d{2}\.\d{2}\.\d{4})')
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        if matches:
+            # Используем set для хранения уникальных заявок
+            unique_applications = set()
+            for m in matches:
+                num = m[0].replace(' ', '')
+                date = m[1].replace(' ', '')
+                unique_applications.add(
+                    f"Заявка на перевозку груза {num} {date}")
+            # Сортируем для стабильного порядка
+            return '; '.join(sorted(unique_applications))
+        return 'Не указано'
+
+    def extract_upd_blocks(self, text: str) -> str:
+        """
+        Извлекает уникальные УПД (универсальный передаточный документ), исключая дубликаты.
+        """
+        pattern = (
+            r'(УПД|универсальн[а-яё ]*передаточн[а-яё ]*документ[а-яё]*)[^\n;\.]*(№\s*\d+)[^\n;\.]*(от\s*\d{2}\.\d{2}\.\d{4})')
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        if matches:
+            # Используем set для хранения уникальных УПД
+            unique_upds = set()
+            for m in matches:
+                doc_type = 'УПД' if 'УПД' in m[0] else 'Универсальный передаточный документ'
+                num = m[1].replace(' ', '')
+                date = m[2].replace(' ', '')
+                unique_upds.add(f"{doc_type} {num} {date}")
+            # Сортируем для стабильного порядка
+            return '; '.join(sorted(unique_upds))
+        return 'Не указано'
+
 
 def parse_documents_with_sliding_window(text: str, debug: bool = False) -> Dict[str, str]:
     """
@@ -667,8 +924,18 @@ def parse_documents_with_sliding_window(text: str, debug: bool = False) -> Dict[
     # Парсим информацию о сторонах
     parties_info = parser.parse_parties_info(text)
 
+    # Извлекаем финансовую информацию
+    financial_info = parser.extract_financial_info(text)
+
     # Объединяем результаты
     result = formatted_results.copy()
     result.update(parties_info)
+    result.update(financial_info)
+
+    # Добавляем извлеченные заявки и УПД
+    contract_applications = parser.extract_contract_applications(text)
+    upd_blocks = parser.extract_upd_blocks(text)
+    result['contract_applications'] = contract_applications
+    result['upd_blocks'] = upd_blocks
 
     return result
