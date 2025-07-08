@@ -358,6 +358,8 @@ class SlidingWindowParser:
                 continue
             elif line.startswith('от'):
                 current_section = 'plaintiff'
+
+                # Обработка ИП
                 ip_match = re.match(
                     r'от\s+Индивидуального предпринимателя\s+(.+)', line)
                 if ip_match:
@@ -366,63 +368,36 @@ class SlidingWindowParser:
                     plaintiff_data['name'] = f"Индивидуальный предприниматель {fio_nom}"
                     continue
 
-                # Обрабатываем случай, когда название организации разбито на строки
-                if i + 1 < len(lines):
-                    next_line = lines[i + 1].strip()
+                # Обработка ООО - собираем полное название из нескольких строк
+                if 'Обществ' in line:
+                    # Собираем название организации из текущей и следующих строк
+                    # Убираем "от" из первой строки
+                    org_name_parts = [line.replace('от ', '')]
 
-                    # Проверяем, есть ли еще одна строка с названием организации
-                    if i + 2 < len(lines):
-                        third_line = lines[i + 2].strip()
-                        # Проверяем, что третья строка не содержит реквизиты
-                        if third_line and not any(x in third_line for x in ['ИНН', 'ОГРНИП', 'ОГРН', 'КПП']):
-                            # Собираем полное название из двух строк
-                            full_name = f"{next_line} {third_line}"
-                            if any(x in full_name for x in ['ООО', 'Общество']):
-                                plaintiff_data['name'] = self.convert_to_nominative(
-                                    full_name)
-                                continue
-                        # Если третья строка содержит реквизиты, используем только вторую строку
-                        elif any(x in third_line for x in ['ИНН', 'ОГРНИП', 'ОГРН', 'КПП']):
-                            # Если вторая строка — просто кавычки, объединяем с предыдущей
-                            if next_line.startswith('«') and next_line.endswith('»'):
-                                full_name = f"Общество с ограниченной ответственностью {next_line}"
-                                plaintiff_data['name'] = self.convert_to_nominative(
-                                    full_name)
-                                continue
-                            if any(x in next_line for x in ['ООО', 'Общество']):
-                                plaintiff_data['name'] = self.convert_to_nominative(
-                                    next_line)
-                continue
+                    # Проверяем следующие строки на наличие названия организации
+                    j = i + 1
+                    while j < len(lines) and j < i + 3:  # Максимум 3 строки
+                        next_line = lines[j].strip()
+                        if not next_line:
+                            j += 1
+                            continue
 
-            # Проверяем, определена ли переменная next_line
-            if 'next_line' in locals() and next_line.startswith('Индивидуальный предприниматель'):
-                if i + 2 < len(lines):
-                    fio_line = lines[i + 2].strip()
-                    if fio_line and not any(x in fio_line for x in ['ИНН', 'ОГРНИП', 'ОГРН', 'КПП']):
-                        fio_nom = self.convert_ip_fio_to_nominative(
-                            fio_line)
-                        plaintiff_data['name'] = f"Индивидуальный предприниматель {fio_nom}"
-                        continue
-                elif next_line and not any(x in next_line for x in ['ИНН', 'ОГРНИП', 'ОГРН', 'КПП']):
-                    if 'Индивидуальный предприниматель' in next_line:
-                        fio = next_line.replace(
-                            'Индивидуальный предприниматель', '').strip()
-                        if fio:
-                            fio_nom = self.convert_ip_fio_to_nominative(
-                                fio)
-                            plaintiff_data['name'] = f"Индивидуальный предприниматель {fio_nom}"
-                            continue
-                    elif any(x in next_line for x in ['ООО', 'Общество']):
-                        plaintiff_data['name'] = self.convert_to_nominative(
-                            next_line)
-                        continue
-                    else:
-                        fio_parts = next_line.split()
-                        if 2 <= len(fio_parts) <= 4 and fio_parts[0][0].isupper():
-                            fio_nom = self.convert_ip_fio_to_nominative(
-                                next_line)
-                            plaintiff_data['name'] = f"Индивидуальный предприниматель {fio_nom}"
-                            continue
+                        # Если строка содержит реквизиты, останавливаемся
+                        if any(x in next_line for x in ['ИНН', 'ОГРНИП', 'ОГРН', 'КПП']):
+                            break
+
+                        # Если строка содержит кавычки или название организации, добавляем
+                        if ('«' in next_line and '»' in next_line) or any(x in next_line for x in ['ООО', 'Обществ']):
+                            org_name_parts.append(next_line)
+
+                        j += 1
+
+                    # Собираем полное название
+                    full_name = ' '.join(org_name_parts)
+                    plaintiff_data['name'] = self.convert_to_nominative(
+                        full_name)
+                    continue
+
                 continue
             if current_section == 'defendant':
                 inn_match = re.search(r'ИНН\s+(\d+)', line)
@@ -496,17 +471,27 @@ class SlidingWindowParser:
                 party1 = f"ИП {ip_fio_nom}".strip()
             parties['contract_parties'] = f"Между {party1} и {party2}"
 
-            # Формируем contract_parties_short с использованием полных названий
-            # Для истца используем сокращение ИП, если это ИП
+            # Формируем contract_parties_short с использованием сокращенных названий
+            # Для истца используем сокращение ИП, если это ИП, или ООО для ООО
             party1_short = party1.replace(
                 'Индивидуальный предприниматель', 'ИП')
+            party1_short = party1_short.replace(
+                'Общество с ограниченной ответственностью', 'ООО')
 
             # Для ответчика используем полное название из извлеченных данных
             defendant_name = parties.get('defendant_name', '')
             if defendant_name:
-                party2_short = defendant_name
+                # Применяем сокращения к полному названию ответчика
+                party2_short = defendant_name.replace(
+                    'Общество с ограниченной ответственностью', 'ООО')
+                party2_short = party2_short.replace(
+                    'Индивидуальный предприниматель', 'ИП')
             else:
-                party2_short = party2
+                # Если нет полного названия, используем сокращение
+                party2_short = party2.replace(
+                    'Общество с ограниченной ответственностью', 'ООО')
+                party2_short = party2_short.replace(
+                    'Индивидуальный предприниматель', 'ИП')
 
             # Восстанавливаем кавычки, если были
             if '«' in contract_match.group(1) and '»' in contract_match.group(1):
@@ -524,6 +509,7 @@ class SlidingWindowParser:
         # Простые замены для основных падежей
         replacements = {
             'Обществу с ограниченной ответственностью': 'Общество с ограниченной ответственностью',
+            'Общества с ограниченной ответственностью': 'Общество с ограниченной ответственностью',
             'Индивидуальному предпринимателю': 'Индивидуальный предприниматель',
             'ООО': 'Общество с ограниченной ответственностью',
             'ИП': 'Индивидуальный предприниматель'
@@ -599,9 +585,9 @@ class SlidingWindowParser:
             pairs = []
             for doc in docs:
                 if doc['number'] and doc['date']:
-                    pairs.append((f"№ {doc['number']}", doc['date']))
+                    pairs.append((f"№{doc['number']}", doc['date']))
                 elif doc['number']:
-                    pairs.append((f"№ {doc['number']}", None))
+                    pairs.append((f"№{doc['number']}", None))
 
             # Удаляем дубликаты
             unique_pairs = list(set(pairs))
@@ -630,10 +616,7 @@ class SlidingWindowParser:
         elif doc_type == 'invoice_blocks':
             return 'Счет на оплату'
         elif doc_type == 'upd_blocks':
-            if 'акт' in header_lower:
-                return 'Акт выполненных работ'
-            else:
-                return 'УПД'
+            return 'Акт'
         elif doc_type == 'cargo_docs':
             if 'комплект' in header_lower:
                 return 'Комплект сопроводительных документов'
@@ -750,9 +733,20 @@ class SlidingWindowParser:
 
         # Извлекаем юридические услуги
         legal_patterns = [
+            # Более гибкий паттерн для поиска юридических услуг с любым текстом между
             r'юридические услуги[^0-9]*составляют\s*([0-9\s,]+)\s*рубл',
             r'юридические услуги[^0-9]*в размере\s*([0-9\s,]+)\s*рубл',
             r'оплатил[^0-9]*денежные средства[^0-9]*в размере\s*([0-9\s,]+)\s*рубл',
+            # Паттерн для случая, когда сумма указана в списке
+            r'(\d[\d\s,]*)\s*рубл[а-яё]*\s*-\s*юридические услуги',
+            # Более гибкий паттерн для поиска юридических услуг
+            r'юридические услуги[^0-9]*(\d[\d\s,]*)\s*рубл',
+            # Паттерн для поиска в конце предложения
+            r'юридические услуги[^.]*(\d[\d\s,]*)\s*рубл[а-яё]*[^.]*\.',
+            # Самый гибкий паттерн - ищем "юридические услуги" и любую сумму рублей после
+            r'юридические услуги[^0-9]*(\d[\d\s,]*)\s*рубл[а-яё]*',
+            # Паттерн для поиска в списке требований
+            r'(\d[\d\s,]*)\s*рубл[а-яё]*\s*-\s*юридические услуги[^.]*',
         ]
 
         legal_fees = None
@@ -861,43 +855,155 @@ class SlidingWindowParser:
 
         return result
 
+    def extract_signatory(self, text: str) -> str:
+        """
+        Извлекает подписанта из текста.
+        """
+        signatory_patterns = [
+            r'_________________\s*/([^/]+)/',
+            r'подпись[^:]*:\s*([^\n]+)',
+            r'подписал[^:]*:\s*([^\n]+)',
+        ]
+
+        for pattern in signatory_patterns:
+            signatory_match = re.search(pattern, text, re.IGNORECASE)
+            if signatory_match:
+                return signatory_match.group(1).strip()
+
+        return "Не указано"
+
+    def extract_attachments(self, text: str) -> list:
+        """
+        Извлекает список приложений из текста.
+        """
+        # Ищем блок с приложениями
+        attachment_patterns = [
+            r'Приложения?:?\s*\n(.*?)(?=\n\n|\nот|\nТРЕБОВАНИЕ|\nПРЕТЕНЗИЯ|\Z)',
+            r'Приложен[а-яё]*:?\s*\n(.*?)(?=\n\n|\nот|\nТРЕБОВАНИЕ|\nПРЕТЕНЗИЯ|\Z)',
+        ]
+
+        attachments = []
+        for pattern in attachment_patterns:
+            attachment_match = re.search(
+                pattern, text, re.DOTALL | re.IGNORECASE)
+            if attachment_match:
+                attachment_text = attachment_match.group(1).strip()
+                # Разбиваем на строки и убираем пустые
+                lines = [line.strip()
+                         for line in attachment_text.split('\n') if line.strip()]
+
+                # Обрабатываем каждую строку
+                for line in lines:
+                    # Убираем номер в начале строки (например, "1.\t" или "1.     ")
+                    cleaned_line = re.sub(r'^\d+\.\s*\t*\s*', '', line)
+                    # Убираем лишние пробелы
+                    cleaned_line = cleaned_line.strip()
+                    # Добавляем только если это не пустая строка и не дубликат
+                    if cleaned_line and cleaned_line not in attachments:
+                        attachments.append(cleaned_line)
+
+        # Если не нашли блок приложений, ищем отдельные упоминания
+        if not attachments:
+            # Ищем упоминания документов в тексте
+            doc_patterns = [
+                r'копия[^.]*\.',
+                r'документ[^.]*\.',
+                r'счет[^.]*\.',
+                r'УПД[^.]*\.',
+                r'заявка[^.]*\.',
+            ]
+
+            for pattern in doc_patterns:
+                matches = re.finditer(pattern, text, re.IGNORECASE)
+                for match in matches:
+                    doc_text = match.group(0).strip()
+                    if doc_text not in attachments:
+                        attachments.append(doc_text)
+
+        return attachments if attachments else ["Не указано"]
+
     def extract_contract_applications(self, text: str) -> str:
         """
-        Извлекает уникальные заявки на перевозку груза, исключая дубликаты.
+        Извлекает уникальные заявки и договоры-заявки, исключая дубликаты.
         """
-        # Ищем все конструкции вида 'договор(-| )заявка на перевозку груза № ... от ...'
-        pattern = (
-            r'(?:договор[\s-]*заявк[аи]?|заявк[аи]? на перевозку груза)[^\n;\.]*(№\s*\d+)[^\n;\.]*(от\s*\d{2}\.\d{2}\.\d{4})')
-        matches = re.findall(pattern, text, re.IGNORECASE)
-        if matches:
-            # Используем set для хранения уникальных заявок
-            unique_applications = set()
-            for m in matches:
-                num = m[0].replace(' ', '')
-                date = m[1].replace(' ', '')
+        # Универсальный паттерн: ищет заявки в разных падежах и форматах
+        patterns = [
+            # Заявка на перевозку груза № 2910/2 от 29.10.2024 г.
+            r'(?:заявк[аи]? на перевозку груза|заявк[аи]? на перевозку|заявк[аи]? на транспортировку груза|заявк[аи]?|транспортн[а-яё]* заявк[аи]?)[^\n;\.]*№\s*(\d+(?:/\d+)?)[^\n;\.]*от\s*(\d{2}\.\d{2}\.\d{4})',
+            # Договор-заявка на перевозку груза № 2910/2 от 29.10.2024 г.
+            r'(?:договор[\s-]*заявк[аи]?|договор[\s-]*заявк[аи]? на перевозку|договор[\s-]*заявк[аи]? на перевозку груза)[^\n;\.]*№\s*(\d+(?:/\d+)?)[^\n;\.]*от\s*(\d{2}\.\d{2}\.\d{4})',
+            # Приложение к договору-заявке № 2910/2 от 29.10.2024 г.
+            r'приложение[^\n;\.]*к[^\n;\.]*(?:договор[\s-]*заявк[аи]?|заявк[аи]?)[^\n;\.]*№\s*(\d+(?:/\d+)?)[^\n;\.]*от\s*(\d{2}\.\d{2}\.\d{4})',
+        ]
+
+        unique_applications = set()
+        for pattern in patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            for num, date in matches:
                 unique_applications.add(
-                    f"Заявка на перевозку груза {num} {date}")
-            # Сортируем для стабильного порядка
+                    f"Заявка на перевозку груза №{num} от {date} г.")
+
+        if unique_applications:
             return '; '.join(sorted(unique_applications))
         return 'Не указано'
 
     def extract_upd_blocks(self, text: str) -> str:
         """
-        Извлекает уникальные УПД (универсальный передаточный документ), исключая дубликаты.
+        Извлекает уникальные УПД и акты, исключая дубликаты.
         """
-        pattern = (
-            r'(УПД|универсальн[а-яё ]*передаточн[а-яё ]*документ[а-яё]*)[^\n;\.]*(№\s*\d+)[^\n;\.]*(от\s*\d{2}\.\d{2}\.\d{4})')
-        matches = re.findall(pattern, text, re.IGNORECASE)
-        if matches:
-            # Используем set для хранения уникальных УПД
-            unique_upds = set()
-            for m in matches:
-                doc_type = 'УПД' if 'УПД' in m[0] else 'Универсальный передаточный документ'
-                num = m[1].replace(' ', '')
-                date = m[2].replace(' ', '')
-                unique_upds.add(f"{doc_type} {num} {date}")
-            # Сортируем для стабильного порядка
+        # Универсальный паттерн для УПД и актов в разных форматах
+        patterns = [
+            # УПД выполненных работ № 72 от 08.11.2025 г.
+            r'(?:УПД|универсальн[а-яё ]*передаточн[а-яё ]*документ[а-яё]*)[^\n;\.]*№\s*(\d+)[^\n;\.]*от\s*(\d{2}\.\d{2}\.\d{4})',
+            # УПД № 72 от 08.11.2025 г.
+            r'УПД[^\n;\.]*№\s*(\d+)[^\n;\.]*от\s*(\d{2}\.\d{2}\.\d{4})',
+            # Акт выполненных работ № 96 от 11.11.2024 г.
+            r'акт[а-яё]* выполненных работ[^\n;\.]*№\s*(\d+)[^\n;\.]*от\s*(\d{2}\.\d{2}\.\d{4})',
+            # Акт оказанных услуг № 96 от 11.11.2024 г.
+            r'акт[а-яё]* оказанных услуг[^\n;\.]*№\s*(\d+)[^\n;\.]*от\s*(\d{2}\.\d{2}\.\d{4})',
+            # Акт сдачи-приемки услуг № 96 от 11.11.2024 г.
+            r'акт[а-яё]* сдачи[^\n;\.]*приемки[^\n;\.]*услуг[^\n;\.]*№\s*(\d+)[^\n;\.]*от\s*(\d{2}\.\d{2}\.\d{4})',
+            # Акт сдачи-приемки выполненных работ № 96 от 11.11.2024 г.
+            r'акт[а-яё]* сдачи[^\n;\.]*приемки[^\n;\.]*выполненных работ[^\n;\.]*№\s*(\d+)[^\n;\.]*от\s*(\d{2}\.\d{2}\.\d{4})',
+            # Акт № 96 от 11.11.2024 г. (общий паттерн для актов)
+            r'акт[а-яё]*[^\n;\.]*№\s*(\d+)[^\n;\.]*от\s*(\d{2}\.\d{2}\.\d{4})',
+        ]
+
+        unique_upds = set()
+        for pattern in patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            for num, date in matches:
+                # Определяем тип документа по паттерну
+                if 'УПД' in pattern or 'универсальн' in pattern:
+                    unique_upds.add(f"УПД №{num} от {date} г.")
+                else:
+                    unique_upds.add(
+                        f"Акт выполненных работ №{num} от {date} г.")
+
+        if unique_upds:
             return '; '.join(sorted(unique_upds))
+        return 'Не указано'
+
+    def extract_invoice_blocks(self, text: str) -> str:
+        """
+        Извлекает уникальные счета и счета-фактуры, исключая дубликаты.
+        """
+        # Универсальный паттерн для счетов в разных форматах
+        patterns = [
+            # Счет на оплату № 81 от 31.10.2024 г.
+            r'(?:счет[а-яё]* на оплату|счет[а-яё]*|счет[а-яё]*[\s-]*фактур[а-яё]*)[^\n;\.]*№\s*(\d+)[^\n;\.]*от\s*(\d{2}\.\d{2}\.\d{4})',
+            # Счетом на оплату № 81 от 31.10.2024 г.
+            r'счет[а-яё]*[^\n;\.]*№\s*(\d+)[^\n;\.]*от\s*(\d{2}\.\d{2}\.\d{4})',
+        ]
+
+        unique_invoices = set()
+        for pattern in patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            for num, date in matches:
+                unique_invoices.add(f"Счет на оплату №{num} от {date} г.")
+
+        if unique_invoices:
+            return '; '.join(sorted(unique_invoices))
         return 'Не указано'
 
 
@@ -935,7 +1041,15 @@ def parse_documents_with_sliding_window(text: str, debug: bool = False) -> Dict[
     # Добавляем извлеченные заявки и УПД
     contract_applications = parser.extract_contract_applications(text)
     upd_blocks = parser.extract_upd_blocks(text)
+    invoice_blocks = parser.extract_invoice_blocks(text)
     result['contract_applications'] = contract_applications
     result['upd_blocks'] = upd_blocks
+    result['invoice_blocks'] = invoice_blocks
+
+    # Добавляем подписанта и приложения
+    signatory = parser.extract_signatory(text)
+    attachments = parser.extract_attachments(text)
+    result['signatory'] = signatory
+    result['attachments'] = attachments
 
     return result

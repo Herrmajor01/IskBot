@@ -5,7 +5,7 @@
 
 import logging
 import os
-import tempfile
+import re
 import uuid
 from datetime import datetime
 from typing import Tuple
@@ -23,7 +23,6 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
 
 from cal import calculate_duty
 from calc_395 import calculate_full_395, get_key_rates_from_395gk
-from parsing import parse_claim_data
 from sliding_window_parser import parse_documents_with_sliding_window
 
 load_dotenv()
@@ -100,8 +99,8 @@ def insert_interest_table(doc, details):
             for row in details:
                 cells = table.add_row().cells
                 cells[0].text = f"{row['sum']:,.2f}".replace(',', ' ')
-                cells[1].text = row['date_from']
-                cells[2].text = row['date_to']
+                cells[1].text = row['date_from'] + ' г.'
+                cells[2].text = row['date_to'] + ' г.'
                 cells[3].text = str(row['days'])
                 cells[4].text = str(row['rate'])
                 cells[5].text = row['formula']
@@ -209,16 +208,53 @@ def format_placeholder_paragraph_plain(paragraph, value):
     run.font.size = Pt(12)
 
 
+def format_document_list(document_string: str) -> str:
+    """
+    Форматирует список документов с переносами строк.
+
+    Args:
+        document_string: Строка с документами, разделенными точкой с запятой
+
+    Returns:
+        Отформатированная строка с переносами строк
+    """
+    if not document_string or document_string == 'Не указано':
+        return document_string
+
+    # Разделяем по точке с запятой и убираем пустые строки
+    documents = [doc.strip()
+                 for doc in document_string.split(';') if doc.strip()]
+
+    if not documents:
+        return document_string
+
+    # Форматируем каждый документ без маркера
+    formatted_docs = []
+    for doc in documents:
+        # Убираем лишние пробелы
+        formatted_docs.append(doc.strip())
+
+    # Соединяем документы с переносами строк
+    return ';\n'.join(formatted_docs) + ';'
+
+
 def replace_placeholders_robust(doc, replacements):
     """
-    Заменяет плейсхолдеры в документе, применяя жирное начертание только для указанных полей.
+    Заменяет плейсхолдеры в документе, применяя жирное начертание только для указанных полей и строк.
     """
     bold_placeholders = [
         '{court_name}', '{plaintiff_name}', '{defendant_name}',
         '{total_claim}', '{duty}'
     ]
+    # Ключевые фразы для жирного
+    bold_lines = [
+        'Арбитражный суд по месту нахождения ответчика',
+        'Истец:',
+        'Ответчик:',
+        'Цена иска:',
+        'Государственная пошлина:'
+    ]
 
-    # Проверяем, является ли истец или ответчик ИП
     is_plaintiff_ip = 'ИП' in str(replacements.get(
         '{plaintiff_name}', '')) or 'Индивидуальный предприниматель' in str(replacements.get('{plaintiff_name}', ''))
     is_defendant_ip = 'ИП' in str(replacements.get(
@@ -229,7 +265,6 @@ def replace_placeholders_robust(doc, replacements):
 
         # Удаляем строки с КПП для ИП
         if is_plaintiff_ip and 'КПП' in full_text and '{plaintiff_kpp}' in full_text:
-            # Удаляем только строку с КПП истца, а не весь параграф
             lines = full_text.split('\n')
             filtered_lines = []
             for line in lines:
@@ -238,7 +273,6 @@ def replace_placeholders_robust(doc, replacements):
             full_text = '\n'.join(filtered_lines)
 
         if is_defendant_ip and 'КПП' in full_text and '{defendant_kpp}' in full_text:
-            # Удаляем только строку с КПП ответчика, а не весь параграф
             lines = full_text.split('\n')
             filtered_lines = []
             for line in lines:
@@ -256,41 +290,41 @@ def replace_placeholders_robust(doc, replacements):
         if replaced:
             paragraph.clear()
             paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            # Проверяем, содержит ли параграф один из bold_placeholders
-            is_bold = any(
-                placeholder in full_text for placeholder in bold_placeholders)
-            run = paragraph.add_run(full_text)
-            run.bold = is_bold
-            run.font.name = 'Times New Roman'
-            run.font.size = Pt(12)
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for paragraph in cell.paragraphs:
-                    full_text = ''.join(run.text for run in paragraph.runs)
-                    replaced = False
-                    for key, value in replacements.items():
-                        if key in full_text:
-                            replaced = True
-                            clean_value = str(value).replace(
-                                '\n', ' ').replace('\r', ' ').strip()
-                            full_text = full_text.replace(key, clean_value)
-                    if replaced:
-                        paragraph.clear()
-                        paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                        is_bold = any(
-                            placeholder in full_text for placeholder in bold_placeholders)
-                        run = paragraph.add_run(full_text)
-                        run.bold = is_bold
-                        run.font.name = 'Times New Roman'
-                        run.font.size = Pt(12)
+            # Проверяем, должна ли строка быть жирной
+            is_bold = False
+            for bold_line in bold_lines:
+                if full_text.strip().startswith(bold_line):
+                    is_bold = True
+            # Специально для "Истец:" и "Ответчик:" — только первая строка жирная
+            if full_text.strip().startswith('Истец:') or full_text.strip().startswith('Ответчик:'):
+                lines = full_text.split('\n')
+                for i, line in enumerate(lines):
+                    run = paragraph.add_run(line)
+                    run.bold = (i == 0)
+                    run.font.name = 'Times New Roman'
+                    run.font.size = Pt(12)
+                    if i < len(lines) - 1:
+                        paragraph.add_run('\n')
+            else:
+                run = paragraph.add_run(full_text)
+                run.bold = is_bold
+                run.font.name = 'Times New Roman'
+                run.font.size = Pt(12)
+
+
+def fix_number_spacing(text: str) -> str:
+    """
+    Добавляет пробел после '№', если его нет.
+    """
+    return re.sub(r'№(\d)', r'№ \1', text)
 
 
 def replace_attachments_with_paragraphs(doc, attachments):
     """
-    Заменяет плейсхолдер {attachments} списком приложений, каждое в отдельном параграфе
-    без нумерации, сохраняя статические приложения из шаблона.
+    Заменяет плейсхолдер {attachments} списком приложений с нумерацией и добавляет заголовок 'Приложения:'.
+    Ожидается, что в шаблоне только {attachments} на отдельной строке.
     """
+    import logging
     idx = None
     for i, paragraph in enumerate(doc.paragraphs):
         if '{attachments}' in paragraph.text:
@@ -313,19 +347,144 @@ def replace_attachments_with_paragraphs(doc, attachments):
         parent.insert(idx, new_par._element)
         idx += 1
 
-        # Добавляем динамические приложения без нумерации
+        # Ключевые слова для жирного
+        bold_keywords = [
+            "Заявка", "Счет", "УПД", "Акт", "Комплект сопроводительных документов"
+        ]
+
+        # Динамические приложения с нумерацией
+        attachment_number = 1
         for att in attachments:
-            # Удаляем точку с запятой и лишние пробелы
-            att_clean = att.rstrip(';').strip()
+            att_clean = fix_number_spacing(att.rstrip(';').strip())
             new_par = doc.add_paragraph()
-            run = new_par.add_run(f"{att_clean};")
+            # Проверяем, нужно ли выделять жирным
+            is_bold = any(att_clean.startswith(word) for word in bold_keywords)
+            run = new_par.add_run(f"{attachment_number}. {att_clean};")
+            run.font.name = 'Times New Roman'
+            run.font.size = Pt(12)
+            run.bold = is_bold
+            new_par.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            parent.insert(idx, new_par._element)
+            idx += 1
+            attachment_number += 1
+
+        # Статические приложения
+        static_attachments = [
+            "Документы, подтверждающие отправку искового заявления Ответчику – копия",
+            "Документы, подтверждающие оплату государственной пошлины – копия",
+            "Выписка из ЕГРЮЛ на Истца – электронная версия",
+            "Выписка из ЕГРЮЛ на Ответчика – электронная версия"
+        ]
+        for static_att in static_attachments:
+            static_att = fix_number_spacing(static_att)
+            new_par = doc.add_paragraph()
+            run = new_par.add_run(f"{attachment_number}. {static_att};")
             run.font.name = 'Times New Roman'
             run.font.size = Pt(12)
             run.bold = False
             new_par.alignment = WD_ALIGN_PARAGRAPH.LEFT
             parent.insert(idx, new_par._element)
             idx += 1
-            logging.info(f"Добавлено динамическое приложение: {att_clean}")
+            attachment_number += 1
+    else:
+        logging.warning("Плейсхолдер {attachments} не найден в документе")
+
+
+def format_organization_name_short(full_name: str) -> str:
+    """
+    Форматирует полное название организации/ИП в краткий формат.
+
+    Args:
+        full_name: Полное название организации или ИП
+
+    Returns:
+        Краткий формат названия в кавычках
+    """
+    if not full_name or full_name == 'Не указано':
+        return 'Не указано'
+
+    # Для ИП
+    if 'Индивидуальный предприниматель' in full_name:
+        # Извлекаем ФИО после "Индивидуальный предприниматель"
+        fio = full_name.replace('Индивидуальный предприниматель', '').strip()
+        # Форматируем ФИО в формат "Фамилия И.О."
+        parts = fio.split()
+        if len(parts) >= 2:
+            surname = parts[0]
+            # Берем первые 2 инициала
+            initials = '.'.join([part[0] for part in parts[1:3]]) + '.'
+            return f'ИП «{surname} {initials}»'
+        else:
+            return f'ИП «{fio}»'
+
+    # Для ООО
+    elif 'Общество с ограниченной ответственностью' in full_name:
+        # Извлекаем название в кавычках
+        match = re.search(r'«(.+?)»', full_name)
+        if match:
+            return f'ООО «{match.group(1)}»'
+        else:
+            # Если нет кавычек, берем все после ООО
+            name = full_name.replace(
+                'Общество с ограниченной ответственностью',
+                '').strip()
+            return f'ООО «{name}»'
+
+    # Для ЗАО
+    elif 'Закрытое акционерное общество' in full_name:
+        match = re.search(r'«(.+?)»', full_name)
+        if match:
+            return f'ЗАО «{match.group(1)}»'
+        else:
+            name = full_name.replace(
+                'Закрытое акционерное общество',
+                '').strip()
+            return f'ЗАО «{name}»'
+
+    # Для ПАО
+    elif 'Публичное акционерное общество' in full_name:
+        match = re.search(r'«(.+?)»', full_name)
+        if match:
+            return f'ПАО «{match.group(1)}»'
+        else:
+            name = full_name.replace(
+                'Публичное акционерное общество', '').strip()
+            return f'ПАО «{name}»'
+
+    # Для ОАО
+    elif 'Открытое акционерное общество' in full_name:
+        match = re.search(r'«(.+?)»', full_name)
+        if match:
+            return f'ОАО «{match.group(1)}»'
+        else:
+            name = full_name.replace(
+                'Открытое акционерное общество', '').strip()
+            return f'ОАО «{name}»'
+
+    # Для АО
+    elif 'Акционерное общество' in full_name:
+        match = re.search(r'«(.+?)»', full_name)
+        if match:
+            return f'АО «{match.group(1)}»'
+        else:
+            name = full_name.replace('Акционерное общество', '').strip()
+            return f'АО «{name}»'
+
+    # Если уже в кратком формате (содержит аббревиатуру)
+    elif any(abbr in full_name for abbr in ['ООО', 'ИП', 'ЗАО', 'ПАО', 'ОАО', 'АО']):
+        # Проверяем, есть ли уже кавычки
+        if '«' in full_name and '»' in full_name:
+            return full_name
+        else:
+            # Добавляем кавычки если их нет
+            match = re.search(r'(ООО|ИП|ЗАО|ПАО|ОАО|АО)\s+(.+)', full_name)
+            if match:
+                return f'{match.group(1)} «{match.group(2).strip()}»'
+            else:
+                return full_name
+
+    # Для остальных случаев возвращаем как есть
+    return full_name
 
 
 def create_isk_document(
@@ -339,7 +498,7 @@ def create_isk_document(
     replace_attachments_with_paragraphs(doc, data.get('attachments', []))
     insert_interest_table(doc, interest_data['details'])
     result_docx = os.path.join(
-        tempfile.gettempdir(), 'Исковое_заявление.docx'
+        os.path.dirname(__file__), 'Исковое_заявление.docx'
     )
     doc.save(result_docx)
     return result_docx
@@ -429,12 +588,13 @@ async def finish_claim(update, context):
             file_path
         )
         return
-    claim_data = parse_claim_data(file_path)
 
     # Извлекаем текст из документа для нового парсера
     doc = Document(file_path)
     text = "\n".join(p.text for p in doc.paragraphs)
-    document_blocks = parse_documents_with_sliding_window(text)
+
+    # Используем только новый парсер
+    claim_data = parse_documents_with_sliding_window(text)
 
     claim_data['claim_number'] = context.user_data.get('claim_number', '')
     claim_data['claim_date'] = context.user_data.get('claim_date', '')
@@ -442,9 +602,12 @@ async def finish_claim(update, context):
     interest_data = calculate_full_395(
         file_path, key_rates=key_rates
     )
-    total_claim = (
-        claim_data['debt'] + interest_data['total_interest']
-    )
+
+    # Получаем сумму долга из нового парсера
+    debt_amount = float(claim_data.get(
+        'debt', '0').replace(' ', '').replace(',', '.'))
+    total_claim = debt_amount + interest_data['total_interest']
+
     duty_data = calculate_duty(total_claim)
     if 'error' in duty_data:
         await update.message.reply_text(str(duty_data['error']))
@@ -454,36 +617,24 @@ async def finish_claim(update, context):
             context.user_data[key] = ''
 
     # Используем данные из нового парсера для истца и ответчика
-    plaintiff_name = document_blocks.get(
-        'plaintiff_name', claim_data['plaintiff']['name'].replace('\n', ' ').strip())
-    defendant_name = document_blocks.get(
-        'defendant_name', claim_data['defendant']['name'].replace('\n', ' ').strip())
-    contract_parties = document_blocks.get('contract_parties', '')
-    contract_parties_short = document_blocks.get('contract_parties_short', '')
+    plaintiff_name = claim_data.get('plaintiff_name', 'Не указано')
+    defendant_name = claim_data.get('defendant_name', 'Не указано')
+    contract_parties = claim_data.get('contract_parties', '')
+    contract_parties_short = claim_data.get('contract_parties_short', '')
 
     # Проверяем, является ли истец ИП
     is_plaintiff_ip = 'ИП' in plaintiff_name or 'Индивидуальный предприниматель' in plaintiff_name
     is_defendant_ip = 'ИП' in defendant_name or 'Индивидуальный предприниматель' in defendant_name
 
     # Форматируем имена для использования в тексте (короткие названия)
-    plaintiff_name_short = plaintiff_name
-    defendant_name_short = defendant_name
-
-    if 'Индивидуальный предприниматель' in plaintiff_name:
-        # Заменяем "Индивидуальный предприниматель Иванов И.И." на "ИП Иванов И.И."
-        plaintiff_name_short = plaintiff_name.replace(
-            'Индивидуальный предприниматель', 'ИП')
-
-    if 'Общество с ограниченной ответственностью' in defendant_name:
-        # Заменяем "Общество с ограниченной ответственностью" на "ООО"
-        defendant_name_short = defendant_name.replace(
-            'Общество с ограниченной ответственностью', 'ООО')
+    plaintiff_name_short = format_organization_name_short(plaintiff_name)
+    defendant_name_short = format_organization_name_short(defendant_name)
 
     replacements = {
         '{claim_paragraph}': generate_claim_paragraph(
             context.user_data
         ),
-        '{postal_block}': document_blocks.get('postal_block', ''),
+        '{postal_block}': format_document_list(claim_data.get('postal_block', '')),
         '{postal_numbers_all}': (
             ', '.join(claim_data.get('postal_numbers', []))
             or 'Не указано'
@@ -492,44 +643,43 @@ async def finish_claim(update, context):
             ', '.join(claim_data.get('postal_dates', []))
             or 'Не указано'
         ),
-        '{court_name}': get_court_by_address(claim_data['defendant']['address'])[0],
-        '{court_address}': get_court_by_address(claim_data['defendant']['address'])[1],
+        '{court_name}': get_court_by_address(claim_data.get('defendant_address', 'Не указано'))[0],
+        '{court_address}': get_court_by_address(claim_data.get('defendant_address', 'Не указано'))[1],
         '{plaintiff_name}': plaintiff_name,
         '{plaintiff_name_short}': plaintiff_name_short,
-        '{plaintiff_inn}': claim_data['plaintiff']['inn'],
-        '{plaintiff_kpp}': '' if is_plaintiff_ip else claim_data['plaintiff']['kpp'],
-        '{plaintiff_ogrn}': claim_data['plaintiff']['ogrn'],
-        '{plaintiff_address}': claim_data['plaintiff']['address'].replace('\n', ' ').strip(),
+        '{plaintiff_name_formatted}': plaintiff_name_short,
+        '{plaintiff_inn}': claim_data.get('plaintiff_inn', 'Не указано'),
+        '{plaintiff_kpp}': '' if is_plaintiff_ip else claim_data.get('plaintiff_kpp', 'Не указано'),
+        '{plaintiff_ogrn}': claim_data.get('plaintiff_ogrn', 'Не указано'),
+        '{plaintiff_address}': claim_data.get('plaintiff_address', 'Не указано').replace('\n', ' ').strip(),
         '{defendant_name}': defendant_name,
         '{defendant_name_short}': defendant_name_short,
-        '{defendant_inn}': claim_data['defendant']['inn'],
-        '{defendant_kpp}': '' if is_defendant_ip else claim_data['defendant']['kpp'],
-        '{defendant_ogrn}': claim_data['defendant']['ogrn'],
-        '{defendant_address}': claim_data['defendant']['address'].replace('\n', ' ').strip(),
+        '{defendant_inn}': claim_data.get('defendant_inn', 'Не указано'),
+        '{defendant_kpp}': '' if is_defendant_ip else claim_data.get('defendant_kpp', 'Не указано'),
+        '{defendant_ogrn}': claim_data.get('defendant_ogrn', 'Не указано'),
+        '{defendant_address}': claim_data.get('defendant_address', 'Не указано').replace('\n', ' ').strip(),
         '{contract_parties}': contract_parties,
         '{contract_parties_short}': contract_parties_short,
         '{total_claim}': f"{total_claim:,.2f}".replace(',', ' '),
         '{duty}': f"{duty_data['duty']:,.0f}".replace(',', ' '),
-        '{debt}': f"{claim_data['debt']:,.2f}".replace(',', ' '),
-        '{contracts}': document_blocks.get('contracts', ''),
-        '{contract_applications}': document_blocks.get('contract_applications', ''),
-        '{cargo_docs}': document_blocks.get('cargo_docs', ''),
-        '{invoice_blocks}': document_blocks.get('invoice_blocks', ''),
-        '{upd_blocks}': document_blocks.get('upd_blocks', ''),
-        '{invoices}': ", ".join(claim_data['invoices'])
-        if claim_data['invoices'] else 'Не указано',
-        '{upds}': ", ".join(claim_data['upds'])
-        if claim_data['upds'] else 'Не указано',
+        '{debt}': f"{debt_amount:,.2f}".replace(',', ' '),
+        '{contracts}': format_document_list(claim_data.get('contracts', '')),
+        '{contract_applications}': format_document_list(claim_data.get('contract_applications', '')),
+        '{cargo_docs}': format_document_list(claim_data.get('cargo_docs', '')),
+        '{invoice_blocks}': format_document_list(claim_data.get('invoice_blocks', '')),
+        '{upd_blocks}': format_document_list(claim_data.get('upd_blocks', '')),
+        '{invoices}': claim_data.get('invoice_blocks', 'Не указано'),
+        '{upds}': claim_data.get('upd_blocks', 'Не указано'),
         '{claim_date}': context.user_data.get('claim_date', ''),
         '{claim_number}': context.user_data.get('claim_number', ''),
         '{total_interest}': f"{interest_data['total_interest']:,.2f}".replace(',', ' '),
-        '{legal_fees}': f"{claim_data['legal_fees']:,.2f}".replace(',', ' '),
+        '{legal_fees}': f"{float(claim_data.get('legal_fees', '0').replace(' ', '')):,.2f}".replace(',', ' '),
         '{total_expenses}': (
-            f"{duty_data['duty'] + claim_data['legal_fees']:,.0f}".replace(
+            f"{float(str(duty_data['duty'])) + float(claim_data.get('legal_fees', '0').replace(' ', '')):,.0f}".replace(
                 ',', ' ')
         ),
-        '{calculation_date}': datetime.today().strftime('%d.%m.%Y'),
-        '{signatory}': claim_data['signatory'].replace('\n', ' ').strip(),
+        '{calculation_date}': datetime.today().strftime('%d.%m.%Y г.'),
+        '{signatory}': claim_data.get('signatory', 'Не указано').replace('\n', ' ').strip(),
         '{signature_block}': claim_data.get('signature_block', 'Не указано'),
         '{postal_numbers}': (
             context.user_data.get('claim_number', '') or 'Не указано'

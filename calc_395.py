@@ -100,8 +100,8 @@ def calc_395_on_periods(
         interest = base_sum * rate / 100 / year_days * days
         total += interest
         details.append({
-            'date_from': date_from.strftime('%d.%m.%Y'),
-            'date_to': date_to.strftime('%d.%m.%Y'),
+            'date_from': date_from.strftime('%d.%m.%Y г.'),
+            'date_to': date_to.strftime('%d.%m.%Y г.'),
             'rate': rate,
             'days': days,
             'interest': round(interest, 2),
@@ -121,7 +121,7 @@ def calculate_full_395(
 
     if today is None:
         today = datetime.today()
-    logging.info(f"Текущая дата: {today.strftime('%d.%m.%Y')}")
+        logging.info(f"Текущая дата: {today.strftime('%d.%m.%Y г.')}")
     if key_rates is None:
         key_rates = get_key_rates_from_395gk()
     periods, base_sum = parse_periods_from_docx(docx_path)
@@ -133,8 +133,8 @@ def calculate_full_395(
             p['date_from'].year % 100 != 0 or p['date_from'].year % 400 == 0) else 365
         interest = p['sum'] * p['days'] * p['rate'] / 100 / year_days
         details.append({
-            'date_from': p['date_from'].strftime('%d.%m.%Y'),
-            'date_to': p['date_to'].strftime('%d.%m.%Y'),
+            'date_from': p['date_from'].strftime('%d.%m.%Y г.'),
+            'date_to': p['date_to'].strftime('%d.%m.%Y г.'),
             'rate': p['rate'],
             'days': p['days'],
             'interest': round(interest, 2),
@@ -146,12 +146,12 @@ def calculate_full_395(
     if periods:
         last = periods[-1]
         logging.info(
-            f"Последняя дата в таблице: {last['date_to'].strftime('%d.%m.%Y')}")
+            f"Последняя дата в таблице: {last['date_to'].strftime('%d.%m.%Y г.')}")
         if last['date_to'] < today:
             actual_start = last['date_to'] + timedelta(days=1)
             actual_end = today
             logging.info(
-                f"Дополнительный период: {actual_start.strftime('%d.%m.%Y')} - {actual_end.strftime('%d.%m.%Y')}")
+                f"Дополнительный период: {actual_start.strftime('%d.%m.%Y г.')} - {actual_end.strftime('%d.%m.%Y г.')}")
             actual_periods = split_period_by_key_rate(
                 actual_start, actual_end, key_rates)
             if not actual_periods:
