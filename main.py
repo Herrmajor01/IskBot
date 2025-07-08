@@ -6,6 +6,7 @@
 import logging
 import os
 import re
+import shutil
 import uuid
 from datetime import datetime
 from typing import Tuple
@@ -50,27 +51,23 @@ def get_court_by_address(defendant_address: str) -> Tuple[str, str]:
     Returns:
         Кортеж (название суда, адрес суда)
     """
-    courts = {
-        "Москва": (
-            "Арбитражный суд города Москвы",
-            "115191, г. Москва, ул. Большая Тульская, д. 17"
-        ),
-        "Челябинск": (
-            "Арбитражный суд Челябинской области",
-            "454091, г. Челябинск, ул. Воровского, д. 2"
-        ),
-        "Волгоград": (
-            "Арбитражный суд Волгоградской области",
-            "400005, г. Волгоград, ул. 7-й Гвардейской, д. 2"
-        ),
-        "Петрозаводск": (
-            "Арбитражный суд Республики Карелия",
-            "185035, г. Петрозаводск, пр. Ленина, д. 21"
-        ),
-    }
-    for city, (court_name, court_address) in courts.items():
-        if city.lower() in defendant_address.lower():
-            return court_name, court_address
+    from courts_code import ARBITRATION_COURTS, CITY_TO_REGION
+
+    defendant_address_lower = defendant_address.lower()
+
+    # Сначала ищем по названию региона
+    for region, court_info in ARBITRATION_COURTS.items():
+        if region.lower() in defendant_address_lower:
+            return court_info["name"], court_info["address"]
+
+    # Если регион не найден, ищем по городам
+    for city, region in CITY_TO_REGION.items():
+        if city in defendant_address_lower:
+            if region in ARBITRATION_COURTS:
+                court_info = ARBITRATION_COURTS[region]
+                return court_info["name"], court_info["address"]
+
+    # Если ничего не найдено, возвращаем общий ответ
     return "Арбитражный суд по месту нахождения ответчика", "Адрес суда не определен"
 
 
@@ -238,12 +235,52 @@ def format_document_list(document_string: str) -> str:
     return ';\n'.join(formatted_docs) + ';'
 
 
+def generate_debt_text(claim_data: dict) -> str:
+    """
+    Генерирует текст о стоимости услуг.
+
+    Args:
+        claim_data: Данные о требованиях
+
+    Returns:
+        Текст о стоимости услуг
+    """
+    debt_amount = claim_data.get('debt', '0')
+    return f"Стоимость услуг по Договору составила {debt_amount} рублей."
+
+
+def generate_payment_terms(claim_data: dict) -> str:
+    """
+    Генерирует текст о порядке оплаты по приоритету:
+    1. Если в payment_terms есть и дни, и дата — возвращает payment_terms
+    2. Если есть только дата — возвращает строку с датой
+    3. Если есть только дни — возвращает строку с днями
+    4. Если ничего нет — стандартный текст
+    """
+    payment_days = claim_data.get('payment_days')
+    payment_due_date = claim_data.get('payment_due_date')
+    payment_terms = claim_data.get('payment_terms', '')
+
+    # Если в тексте требования явно есть оба — используем их как есть
+    if payment_terms and payment_days and payment_due_date:
+        return payment_terms
+    # Если есть только дата
+    if payment_due_date and not payment_days:
+        return f"Срок оплаты не позднее {payment_due_date} г."
+    # Если есть только дни
+    if payment_days and not payment_due_date:
+        return (f"Оплата производится в течение {payment_days} банковских дней "
+                "безналичным расчетом после получения оригиналов документов.")
+    # Если ничего нет — стандарт
+    return "Оплата производится безналичным расчетом после получения оригиналов документов."
+
+
 def replace_placeholders_robust(doc, replacements):
     """
     Заменяет плейсхолдеры в документе, применяя жирное начертание только для указанных полей и строк.
     """
     bold_placeholders = [
-        '{court_name}', '{plaintiff_name}', '{defendant_name}',
+        '{plaintiff_name}', '{defendant_name}',
         '{total_claim}', '{duty}'
     ]
     # Ключевые фразы для жирного
@@ -295,8 +332,32 @@ def replace_placeholders_robust(doc, replacements):
             for bold_line in bold_lines:
                 if full_text.strip().startswith(bold_line):
                     is_bold = True
+
+            # Специальная обработка для строк с названием суда
+            if '{court_name}' in full_text or 'Арбитражный суд' in full_text:
+                # Разбиваем текст на части и применяем жирное начертание к названию суда
+                parts = full_text.split('Арбитражный суд')
+                if len(parts) > 1:
+                    # Первая часть (обычно "В")
+                    if parts[0].strip():
+                        run = paragraph.add_run(parts[0].strip())
+                        run.font.name = 'Times New Roman'
+                        run.font.size = Pt(12)
+                        run.bold = False
+
+                    # Название суда (жирное)
+                    court_part = 'Арбитражный суд' + parts[1]
+                    run = paragraph.add_run(court_part)
+                    run.font.name = 'Times New Roman'
+                    run.font.size = Pt(12)
+                    run.bold = True
+                else:
+                    run = paragraph.add_run(full_text)
+                    run.font.name = 'Times New Roman'
+                    run.font.size = Pt(12)
+                    run.bold = True
             # Специально для "Истец:" и "Ответчик:" — только первая строка жирная
-            if full_text.strip().startswith('Истец:') or full_text.strip().startswith('Ответчик:'):
+            elif full_text.strip().startswith('Истец:') or full_text.strip().startswith('Ответчик:'):
                 lines = full_text.split('\n')
                 for i, line in enumerate(lines):
                     run = paragraph.add_run(line)
@@ -662,7 +723,8 @@ async def finish_claim(update, context):
         '{contract_parties_short}': contract_parties_short,
         '{total_claim}': f"{total_claim:,.2f}".replace(',', ' '),
         '{duty}': f"{duty_data['duty']:,.0f}".replace(',', ' '),
-        '{debt}': f"{debt_amount:,.2f}".replace(',', ' '),
+        '{debt}': generate_debt_text(claim_data),
+        '{payment_terms}': generate_payment_terms(claim_data),
         '{contracts}': format_document_list(claim_data.get('contracts', '')),
         '{contract_applications}': format_document_list(claim_data.get('contract_applications', '')),
         '{cargo_docs}': format_document_list(claim_data.get('cargo_docs', '')),
@@ -787,9 +849,28 @@ def generate_postal_block(postal_numbers, postal_dates):
         )
 
 
+def clean_uploads_folder():
+    """Удаляет все файлы из папки uploads при запуске бота."""
+    uploads_dir = os.path.join(os.path.dirname(__file__), 'uploads')
+    if not os.path.exists(uploads_dir):
+        return
+    for filename in os.listdir(uploads_dir):
+        file_path = os.path.join(uploads_dir, filename)
+        try:
+            if os.path.isfile(file_path):
+                os.remove(file_path)
+                logging.info(f"Удален файл из uploads: {file_path}")
+            elif os.path.isdir(file_path):
+                shutil.rmtree(file_path)
+                logging.info(f"Удалена папка из uploads: {file_path}")
+        except Exception as e:
+            logging.warning(f"Не удалось удалить {file_path}: {e}")
+
+
 def main() -> None:
     """Запускает Telegram бота."""
     logging.info("Starting bot...")
+    clean_uploads_folder()  # Очищаем uploads при запуске
     if TOKEN is None:
         logging.error(
             "TOKEN is not set. Please provide a valid Telegram bot token."

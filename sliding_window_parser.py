@@ -51,7 +51,6 @@ class SlidingWindowParser:
         self.document_headers = {
             'contract_applications': [
                 'заявка', 'заявки', 'заявку', 'заявкой', 'заявок', 'заявкам',
-                'заявками', 'заявках',
                 'заявкой на перевозку груза', 'заявка на перевозку груза',
                 'договор-заявка', 'договор-заявки', 'договор-заявку',
                 'договор-заявкой',
@@ -819,9 +818,9 @@ class SlidingWindowParser:
 
         # Извлекаем срок оплаты
         payment_patterns = [
-            r'в течение\s*(\d+)\s*банковских дней',
-            r'срок оплаты[^0-9]*(\d+)\s*дней',
-            r'оплата[^0-9]*в течение\s*(\d+)\s*дней',
+            r'в течение\s*(\d{1,3})\s*банковских дней(?!\s*\d{2}\.\d{2}\.\d{4})',
+            r'срок оплаты[^0-9]*(\d{1,3})\s*дней(?!\s*\d{2}\.\d{2}\.\d{4})',
+            r'оплата[^0-9]*в течение\s*(\d{1,3})\s*дней(?!\s*\d{2}\.\d{2}\.\d{4})',
         ]
 
         payment_days = None
@@ -836,6 +835,25 @@ class SlidingWindowParser:
 
         if payment_days:
             result['payment_days'] = str(payment_days)
+
+        # Извлекаем полный текст о порядке оплаты
+        payment_terms_patterns = [
+            r'(Согласно[^\n]*оплата[^\n]*производится[^\n]*)',
+            r'(оплата[^\n]*производится[^\n]*)',
+            r'(срок[^\n]*оплаты[^\n]*)',
+            r'(оплата[^\n]*безналичным[^\n]*расчетом[^\n]*)',
+        ]
+
+        payment_terms = None
+        for pattern in payment_terms_patterns:
+            payment_terms_match = re.search(pattern, text, re.IGNORECASE)
+            if payment_terms_match:
+                payment_terms = payment_terms_match.group(1).strip()
+                payment_terms = re.sub(r'\s+', ' ', payment_terms)
+                break
+
+        if payment_terms:
+            result['payment_terms'] = payment_terms
 
         # Извлекаем дату расчета
         date_patterns = [
@@ -852,6 +870,12 @@ class SlidingWindowParser:
 
         if calculation_date:
             result['calculation_date'] = calculation_date
+
+        # Извлекаем дату крайнего срока оплаты
+        due_date_pattern = r'не позднее\s*(\d{2}\.\d{2}\.\d{4})'
+        due_date_match = re.search(due_date_pattern, text, re.IGNORECASE)
+        if due_date_match:
+            result['payment_due_date'] = due_date_match.group(1)
 
         return result
 
