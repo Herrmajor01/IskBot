@@ -83,7 +83,8 @@ def run_tests():
         return True
     else:
         print(
-            f"\n❌ Тесты не прошли: {len(result.failures)} ошибок, {len(result.errors)} исключений")
+            f"\n❌ Тесты не прошли: {len(result.failures)} ошибок, "
+            f"{len(result.errors)} исключений")
         return False
 
 

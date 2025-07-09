@@ -41,7 +41,10 @@ COURTS_DATABASE = {
         'address': '115191, г. Москва, ул. Большая Тульская, д. 17'
     },
     'Санкт-Петербург': {
-        'name': 'Арбитражный суд города Санкт-Петербурга и Ленинградской области',
+        'name': (
+            'Арбитражный суд города Санкт-Петербурга и '
+            'Ленинградской области'
+        ),
         'address': '190000, г. Санкт-Петербург, ул. Марата, д. 72'
     },
     'Адыгея': {
@@ -390,7 +393,10 @@ PARSING_PATTERNS = {
     },
     'dates': {
         'date': r'(\d{2}[\.\/]\d{2}[\.\/]\d{4})',
-        'postal': r'№\s*(\d+)[^\d]{0,40}?об отправке и получении[^\d]{0,40}?(\d{2}\.\d{2}\.\d{4})'
+        'postal': (
+            r'№\s*(\d+)[^\d]{0,40}?об отправке и получении'
+            r'[^\d]{0,40}?(\d{2}\.\d{2}\.\d{4})'
+        )
     }
 }
 
@@ -409,8 +415,15 @@ ERROR_MESSAGES = {
 
 # Сообщения для пользователя
 USER_MESSAGES = {
-    'welcome': 'Добро пожаловать в IskBot! Загрузите документ .docx для начала работы.',
-    'file_uploaded': '✅ Файл "{filename}" успешно загружен и проверен.\nРазмер: {size:.1f} KB\nТеперь ответьте на несколько вопросов для формирования иска.',
+    'welcome': (
+        'Добро пожаловать в IskBot! Загрузите документ .docx для '
+        'начала работы.'
+    ),
+    'file_uploaded': (
+        '✅ Файл "{filename}" успешно загружен и проверен.\n'
+        'Размер: {size:.1f} KB\n'
+        'Теперь ответьте на несколько вопросов для формирования иска.'
+    ),
     'processing': '⏳ Обрабатываю документ...',
     'success': '✅ Исковое заявление успешно сформировано!',
     'error': '❌ Ошибка: {message}',
@@ -431,7 +444,8 @@ def get_court_by_city(city: str) -> Tuple[str, str]:
     city_lower = city.lower()
 
     for court_city, court_info in COURTS_DATABASE.items():
-        if city_lower in court_city.lower() or court_city.lower() in city_lower:
+        if (city_lower in court_city.lower() or
+                court_city.lower() in city_lower):
             return court_info['name'], court_info['address']
 
     # Если город не найден, возвращаем общий суд

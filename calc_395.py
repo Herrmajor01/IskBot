@@ -3,10 +3,9 @@
 """
 
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
-
-from docx import Document
 
 logging.basicConfig(
     level=logging.INFO,
@@ -15,15 +14,13 @@ logging.basicConfig(
 )
 
 
-def parse_periods_from_docx(docx_path: str) -> Tuple[List[Dict[str, Any]], float]:
+def parse_periods_from_docx(
+    docx_path: str
+) -> Tuple[List[Dict[str, Any]], float]:
     """
     Парсит таблицу из .docx и возвращает периоды для расчета процентов.
     Восстановленная версия из старого parsing.py.
     """
-    import logging
-    import re
-    from datetime import datetime
-
     from docx import Document
 
     doc = Document(docx_path)
@@ -53,7 +50,8 @@ def parse_periods_from_docx(docx_path: str) -> Tuple[List[Dict[str, Any]], float
             if not cleaned_for_check:
                 continue
             if re.search(r'[А-Яа-яA-Za-z]', amount_text):
-                if any(word in amount_text.lower() for word in ["сумма", "задолж", "процент"]):
+                skip_words = ["сумма", "задолж", "процент"]
+                if any(word in amount_text.lower() for word in skip_words):
                     continue
             amount_text = re.sub(r'[^\d.,+\-]', '', amount_text)
             if not amount_text:
@@ -69,7 +67,7 @@ def parse_periods_from_docx(docx_path: str) -> Tuple[List[Dict[str, Any]], float
                     current_sum += amount
                 else:
                     current_sum = float(amount_text.replace(',', '.'))
-            except ValueError as e:
+            except ValueError:
                 continue
             date_from_text = cells[1].text.strip()
             date_to_text = cells[2].text.strip()
@@ -77,9 +75,10 @@ def parse_periods_from_docx(docx_path: str) -> Tuple[List[Dict[str, Any]], float
                 continue
             if date_to_text.lower() == "новая задолженность":
                 continue
+            date_pattern = r'\d{2}\.\d{2}\.\d{4}'
             if (
-                not re.match(r'\d{2}\.\d{2}\.\d{4}', date_from_text)
-                or not re.match(r'\d{2}\.\d{2}\.\d{4}', date_to_text)
+                not re.match(date_pattern, date_from_text)
+                or not re.match(date_pattern, date_to_text)
             ):
                 continue
             date_from = datetime.strptime(date_from_text, '%d.%m.%Y')
@@ -103,7 +102,7 @@ def parse_periods_from_docx(docx_path: str) -> Tuple[List[Dict[str, Any]], float
                 continue
             try:
                 interest = float(interest_text.replace(',', '.'))
-            except ValueError as e:
+            except ValueError:
                 continue
             periods.append({
                 'sum': current_sum,
@@ -173,14 +172,17 @@ def get_key_rates_from_395gk() -> List[Tuple[datetime, datetime, float]]:
 
     if not result:
         logging.warning(
-            "Не удалось получить ключевые ставки, используется резервная ставка 21%"
+            "Не удалось получить ключевые ставки, "
+            "используется резервная ставка 21%"
         )
         return [(datetime(2025, 1, 1), datetime.max, 21.0)]
     return result
 
 
 def split_period_by_key_rate(
-    start: datetime, end: datetime, key_rates: List[Tuple[datetime, datetime, float]]
+    start: datetime,
+    end: datetime,
+    key_rates: List[Tuple[datetime, datetime, float]]
 ) -> List[Tuple[datetime, datetime, float]]:
     """
     Делит период на подпериоды по ключевым ставкам.
@@ -198,80 +200,124 @@ def calc_395_on_periods(
     base_sum: float, periods: List[Tuple[datetime, datetime, float]]
 ) -> Tuple[float, List[Dict[str, Any]]]:
     """
-    Считает проценты по ст. 395 ГК РФ для каждого подпериода.
+    Рассчитывает проценты по ст. 395 ГК РФ для списка периодов.
     """
-    total = 0
-    details = []
-    for date_from, date_to, rate in periods:
-        days = (date_to - date_from).days + 1
-        year_days = 366 if date_from.year % 4 == 0 and (
-            date_from.year % 100 != 0 or date_from.year % 400 == 0) else 365
-        interest = base_sum * rate / 100 / year_days * days
-        total += interest
-        details.append({
-            'date_from': date_from.strftime('%d.%m.%Y г.'),
-            'date_to': date_to.strftime('%d.%m.%Y г.'),
-            'rate': rate,
+    total_interest = 0.0
+    detailed_calc = []
+
+    for start, end, rate in periods:
+        days = (end - start).days + 1
+        year_days = 366 if (
+            start.year % 4 == 0 and
+            start.year % 100 != 0 or
+            start.year % 400 == 0
+        ) else 365
+
+        interest = base_sum * days * rate / 100 / year_days
+        total_interest += interest
+
+        detailed_calc.append({
+            'period': f"{start.strftime('%d.%m.%Y')} - {end.strftime('%d.%m.%Y')}",
             'days': days,
-            'interest': round(interest, 2),
-            'sum': base_sum,
-            'formula': f"{base_sum:,.2f} × {days} × {rate}% / {year_days}".replace(',', ' ')
+            'rate': rate,
+            'interest': interest,
+            'formula': (
+                f"{base_sum:,.2f} × {days} × {rate}% / {year_days}"
+                .replace(',', ' ')
+            )
         })
-    return round(total, 2), details
+
+    return total_interest, detailed_calc
 
 
 def calculate_full_395(
-    docx_path: str, today: Optional[datetime] = None, key_rates: Optional[List[Tuple[datetime, datetime, float]]] = None
+    docx_path: str,
+    today: Optional[datetime] = None,
+    key_rates: Optional[List[Tuple[datetime, datetime, float]]] = None
 ) -> Dict[str, Any]:
     """
-    Полный расчет процентов по ст. 395 ГК РФ с учетом всех периодов и ставок.
+    Полный расчет процентов по ст. 395 ГК РФ с парсингом из .docx.
     """
     if today is None:
-        today = datetime.today()
-        logging.info(f"Текущая дата: {today.strftime('%d.%m.%Y г.')}")
+        today = datetime.now()
+
     if key_rates is None:
         key_rates = get_key_rates_from_395gk()
+
     periods, base_sum = parse_periods_from_docx(docx_path)
-    total_interest = 0
-    details = []
+
+    if not periods:
+        return {
+            'total_interest': 0.0,
+            'detailed_calc': [],
+            'base_sum': base_sum,
+            'error': 'Не найдены периоды для расчета'
+        }
+
+    # Расчет для каждого периода из таблицы
+    total_interest = 0.0
+    detailed_calc = []
 
     for p in periods:
-        year_days = 366 if p['date_from'].year % 4 == 0 and (
-            p['date_from'].year % 100 != 0 or p['date_from'].year % 400 == 0) else 365
+        year_days = 366 if (
+            p['date_from'].year % 4 == 0 and
+            p['date_from'].year % 100 != 0 or
+            p['date_from'].year % 400 == 0
+        ) else 365
+
         interest = p['sum'] * p['days'] * p['rate'] / 100 / year_days
-        details.append({
-            'date_from': p['date_from'].strftime('%d.%m.%Y г.'),
-            'date_to': p['date_to'].strftime('%d.%m.%Y г.'),
-            'rate': p['rate'],
-            'days': p['days'],
-            'interest': round(interest, 2),
-            'sum': p['sum'],
-            'formula': f"{p['sum']:,.2f} × {p['days']} × {p['rate']}% / {year_days}".replace(',', ' ')
-        })
         total_interest += interest
 
-    if periods:
-        last = periods[-1]
+        detailed_calc.append({
+            'period': (
+                f"{p['date_from'].strftime('%d.%m.%Y')} - "
+                f"{p['date_to'].strftime('%d.%m.%Y')}"
+            ),
+            'sum': p['sum'],
+            'days': p['days'],
+            'rate': p['rate'],
+            'interest': interest,
+            'formula': (
+                f"{p['sum']:,.2f} × {p['days']} × "
+                f"{p['rate']}% / {year_days}"
+            ).replace(',', ' ')
+        })
+
+    # Проверяем, есть ли дополнительный период после последней даты
+    last = periods[-1]
+    logging.info(
+        f"Последняя дата в таблице: {last['date_to'].strftime('%d.%m.%Y г.')}")
+
+    if last['date_to'] < today:
+        actual_start = last['date_to'] + timedelta(days=1)
+        actual_end = today
+
         logging.info(
-            f"Последняя дата в таблице: {last['date_to'].strftime('%d.%m.%Y г.')}")
-        if last['date_to'] < today:
-            actual_start = last['date_to'] + timedelta(days=1)
-            actual_end = today
-            logging.info(
-                f"Дополнительный период: {actual_start.strftime('%d.%m.%Y г.')} - {actual_end.strftime('%d.%m.%Y г.')}")
-            actual_periods = split_period_by_key_rate(
-                actual_start, actual_end, key_rates)
-            if not actual_periods:
-                logging.warning(
-                    "Не найдены ключевые ставки для дополнительного периода, используется ставка 21%")
-                actual_periods = [(actual_start, actual_end, 21.0)]
-            total_actual, details_actual = calc_395_on_periods(
-                last['sum'], actual_periods)
-            details.extend(details_actual)
-            total_interest += total_actual
+            f"Дополнительный период: "
+            f"{actual_start.strftime('%d.%m.%Y г.')} - "
+            f"{actual_end.strftime('%d.%m.%Y г.')}")
+
+        # Находим подходящие ставки для дополнительного периода
+        additional_periods = split_period_by_key_rate(
+            actual_start, actual_end, key_rates
+        )
+
+        if not additional_periods:
+            logging.warning(
+                "Не найдены ключевые ставки для дополнительного периода, "
+                "используется ставка 21%")
+            additional_periods = [(actual_start, actual_end, 21.0)]
+
+        # Расчет для дополнительного периода
+        additional_interest, additional_calc = calc_395_on_periods(
+            base_sum, additional_periods
+        )
+        total_interest += additional_interest
+        detailed_calc.extend(additional_calc)
 
     return {
-        'total_interest': round(total_interest, 2),
-        'details': details,
-        'base_sum': base_sum
+        'total_interest': total_interest,
+        'detailed_calc': detailed_calc,
+        'base_sum': base_sum,
+        'periods_count': len(periods)
     }

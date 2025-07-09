@@ -6,22 +6,24 @@ Setup script for IskBot
 Telegram bot for automatic generation of court claims
 """
 
-import os
-
 from setuptools import find_packages, setup
 
 
 # Читаем README для описания
 def read_readme():
+    """Читает файл README.md для описания проекта."""
     with open('README.md', 'r', encoding='utf-8') as f:
         return f.read()
 
+
 # Читаем requirements
-
-
 def read_requirements():
+    """Читает файл requirements.txt для зависимостей."""
     with open('requirements.txt', 'r', encoding='utf-8') as f:
-        return [line.strip() for line in f if line.strip() and not line.startswith('#')]
+        return [
+            line.strip() for line in f
+            if line.strip() and not line.startswith('#')
+        ]
 
 
 setup(
