@@ -9,7 +9,7 @@ import re
 import shutil
 import uuid
 from datetime import datetime
-from typing import Tuple
+from typing import List, Optional, Tuple
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -24,12 +24,11 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
 
 from cal import calculate_duty
 from calc_395 import calculate_full_395, get_key_rates_from_395gk
+from llm_fallback import apply_llm_fallback
 from sliding_window_parser import parse_documents_with_sliding_window
 
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-if not TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN не указан в .env")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,7 +37,9 @@ logging.basicConfig(
 )
 logging.info("Bot script started")
 
-ASK_CLAIM_STATUS, ASK_TRACK, ASK_RECEIVE_DATE, ASK_SEND_DATE = range(4)
+# Состояния диалога
+(ASK_JURISDICTION, ASK_CUSTOM_COURT, ASK_CLAIM_STATUS,
+ ASK_TRACK, ASK_RECEIVE_DATE, ASK_SEND_DATE) = range(6)
 
 
 def get_court_by_address(defendant_address: str) -> Tuple[str, str]:
@@ -74,17 +75,18 @@ def get_court_by_address(defendant_address: str) -> Tuple[str, str]:
     )
 
 
-def insert_interest_table(doc, details):
+def insert_interest_table(doc, details, total_interest: Optional[float] = None):
     """
     Вставляет таблицу процентов в документ
     Word вместо маркера {interest_table}.
     """
+    placeholders = ['{{interest_table}}', '{interest_table}']
     headers = [
         'Сумма', 'Дата начала', 'Дата окончания', 'Дни',
         'Ставка', 'Формула', 'Проценты'
     ]
     for i, paragraph in enumerate(doc.paragraphs):
-        if '{interest_table}' in paragraph.text:
+        if any(ph in paragraph.text for ph in placeholders):
             table = doc.add_table(rows=1, cols=len(headers))
             for col, header in enumerate(headers):
                 cell = table.cell(0, col)
@@ -98,13 +100,20 @@ def insert_interest_table(doc, details):
                         )
             for row in details:
                 cells = table.add_row().cells
-                cells[0].text = f"{row['sum']:,.2f}".replace(',', ' ')
-                cells[1].text = row['date_from'] + ' г.'
-                cells[2].text = row['date_to'] + ' г.'
-                cells[3].text = str(row['days'])
-                cells[4].text = str(row['rate'])
-                cells[5].text = row['formula']
-                cells[6].text = f"{row['interest']:,.2f}".replace(',', ' ')
+                row_sum = row.get('sum', 0.0)
+                date_from = row.get('date_from', '')
+                date_to = row.get('date_to', '')
+                if isinstance(date_from, datetime):
+                    date_from = date_from.strftime('%d.%m.%Y')
+                if isinstance(date_to, datetime):
+                    date_to = date_to.strftime('%d.%m.%Y')
+                cells[0].text = f"{row_sum:,.2f}".replace(',', ' ')
+                cells[1].text = f"{date_from} г." if date_from else ''
+                cells[2].text = f"{date_to} г." if date_to else ''
+                cells[3].text = str(row.get('days', ''))
+                cells[4].text = str(row.get('rate', ''))
+                cells[5].text = str(row.get('formula', ''))
+                cells[6].text = f"{row.get('interest', 0.0):,.2f}".replace(',', ' ')
                 for cell in cells:
                     for p in cell.paragraphs:
                         for run in p.runs:
@@ -113,9 +122,29 @@ def insert_interest_table(doc, details):
                             run._element.rPr.rFonts.set(
                                 qn('w:eastAsia'), 'Times New Roman'
                             )
+            if total_interest is None:
+                total_interest = sum(
+                    float(row.get('interest', 0.0) or 0.0)
+                    for row in details
+                )
+            if details or total_interest:
+                total_row = table.add_row().cells
+                label_cell = total_row[0].merge(total_row[5])
+                label_cell.text = 'Итого процентов'
+                total_row[6].text = f"{total_interest:,.2f}".replace(',', ' ')
+                for cell in total_row:
+                    for p in cell.paragraphs:
+                        for run in p.runs:
+                            run.font.size = Pt(10)
+                            run.font.name = 'Times New Roman'
+                            run.bold = True
+                            run._element.rPr.rFonts.set(
+                                qn('w:eastAsia'), 'Times New Roman'
+                            )
             p = paragraph._element
             p.addnext(table._element)
-            paragraph.text = paragraph.text.replace('{interest_table}', '')
+            for placeholder in placeholders:
+                paragraph.text = paragraph.text.replace(placeholder, '')
             break
 
 
@@ -249,24 +278,240 @@ def format_document_list(document_string: str) -> str:
     return ';\n'.join(formatted_docs) + ';'
 
 
+def normalize_str(value: Optional[str], default: str = 'Не указано') -> str:
+    if value is None:
+        return default
+    text = str(value).strip()
+    return text if text else default
+
+
+def parse_amount(value: Optional[str], default: float = 0.0) -> float:
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    cleaned = re.sub(r'\s+', '', str(value)).replace(',', '.')
+    try:
+        return float(cleaned)
+    except ValueError:
+        return default
+
+
+def normalize_payment_terms(text: str) -> str:
+    if not text:
+        return text
+    normalized = re.sub(r'\s+', ' ', str(text)).strip()
+    lower = normalized.lower()
+    if 'условия оплаты' in lower or 'оплаты по договор' in lower:
+        dash_match = re.search(r'\s[–\-]\s*', normalized)
+        colon_index = normalized.find(':')
+        if colon_index != -1 and (dash_match is None or colon_index < dash_match.start()):
+            split_match = re.split(r':\s*', normalized, maxsplit=1)
+        else:
+            split_match = re.split(r'\s[–\-]\s*', normalized, maxsplit=1)
+        if len(split_match) == 2:
+            normalized = split_match[1].strip()
+    if re.search(r'\bг\.$', normalized):
+        return normalized
+    normalized = re.sub(r'[.;:]+$', '', normalized).strip()
+    if normalized.startswith(('«', '"')) and normalized.endswith(('»', '"')):
+        normalized = normalized[1:-1].strip()
+    if '«' in normalized or '»' in normalized or '"' in normalized:
+        normalized = normalized.replace('«', '').replace('»', '').replace('"', '')
+    return normalized
+
+
+def get_ogrn_label(name: str, inn_value: str) -> str:
+    inn_clean = re.sub(r'[^\d]', '', inn_value or '')
+    if (
+        'ИП' in name
+        or 'Индивидуальный предприниматель' in name
+        or len(inn_clean) == 12
+    ):
+        return 'ОГРНИП'
+    return 'ОГРН'
+
+
+def get_first_list_value(values) -> str:
+    if not values:
+        return ''
+    for val in values:
+        if val and str(val).strip():
+            return str(val).strip()
+    return ''
+
+
+def join_list_values(values) -> str:
+    if not values:
+        return ''
+    if isinstance(values, str):
+        return values.strip()
+    cleaned = [str(val).strip() for val in values if str(val).strip()]
+    return ', '.join(cleaned)
+
+
+def normalize_document_item(value: str) -> str:
+    normalized = re.sub(r'\s+', ' ', str(value)).strip()
+    if normalized.endswith(';'):
+        normalized = normalized[:-1].strip()
+    return normalized
+
+
+def format_document_item(value: str) -> str:
+    normalized = normalize_document_item(value)
+    if not normalized:
+        return ''
+    if re.match(r'^\s*(\d+[\.\)]|-)\s+', normalized):
+        return normalized
+    return f"- {normalized}"
+
+
+def build_documents_list(claim_data: dict) -> str:
+    items = []
+    for key in [
+        'contract_applications',
+        'invoice_blocks',
+        'upd_blocks',
+        'cargo_docs',
+        'contracts'
+    ]:
+        value = claim_data.get(key, '')
+        if not value or value == 'Не указано':
+            continue
+        parts = [part.strip() for part in str(value).split(';') if part.strip()]
+        items.extend(parts)
+    if not items:
+        attachments = claim_data.get('attachments', [])
+        if isinstance(attachments, str):
+            attachments = [attachments]
+        for item in attachments:
+            cleaned = normalize_document_item(item)
+            if cleaned and cleaned != 'Не указано':
+                items.append(cleaned)
+    if not items:
+        return 'Не указано'
+    unique = []
+    seen = set()
+    for item in items:
+        cleaned = normalize_document_item(item)
+        if not cleaned or cleaned == 'Не указано':
+            continue
+        if cleaned not in seen:
+            seen.add(cleaned)
+            unique.append(cleaned)
+    if not unique:
+        return 'Не указано'
+    if len(unique) == 1:
+        return unique[0]
+    formatted = [format_document_item(item) for item in unique]
+    return '\n'.join([item for item in formatted if item])
+
+
+def extract_documents_list_structure(text: str) -> Optional[List[Tuple[int, str]]]:
+    lines = [line.strip() for line in str(text).splitlines()]
+
+    start_idx = None
+    for i, line in enumerate(lines):
+        if re.search(r'основани[яе].*задолж', line, re.IGNORECASE):
+            start_idx = i + 1
+            break
+
+    if start_idx is None:
+        return None
+
+    block = []
+    for line in lines[start_idx:]:
+        if not line:
+            continue
+        if re.search(r'итого\s+задолж', line, re.IGNORECASE):
+            break
+        if re.match(r'^\d+\.\d+', line):
+            break
+        if re.search(
+            r'качество исполнения|отправка оригиналов|расчет процентов|приложен',
+            line,
+            re.IGNORECASE,
+        ):
+            break
+        block.append(line)
+
+    if not block:
+        return None
+
+    def strip_list_prefix(value: str) -> str:
+        stripped = re.sub(r'^\s*\d+[\.\)]\s+', '', value)
+        stripped = re.sub(r'^\s*[-\u2022\u00B7]\s+', '', stripped)
+        return stripped.strip()
+
+    def is_document_line(value: str) -> bool:
+        lower = value.lower()
+        return '№' in value or 'комплект сопроводительных документов' in lower
+
+    groups = []
+    current = None
+    for line in block:
+        cleaned = strip_list_prefix(line).rstrip(';').strip()
+        if not cleaned:
+            continue
+        if not is_document_line(cleaned):
+            continue
+        if re.match(r'^(заявк|договор-?заявк)', cleaned, re.IGNORECASE):
+            if current:
+                groups.append(current)
+            current = {'header': cleaned, 'items': []}
+            continue
+        if current:
+            current['items'].append(cleaned)
+        else:
+            groups.append({'header': cleaned, 'items': []})
+
+    if current:
+        groups.append(current)
+
+    if not groups:
+        return None
+
+    structured = []
+    for index, group in enumerate(groups, 1):
+        header = group['header']
+        if group['items']:
+            structured.append((0, f"{index}. {header}"))
+            for item in group['items']:
+                structured.append((1, item))
+        else:
+            structured.append((0, f"{index}. {header}"))
+
+    return structured
+
+
+def expand_placeholder_map(replacements: dict) -> dict:
+    expanded = {}
+    for key, value in replacements.items():
+        expanded[key] = value
+        if key.startswith('{') and key.endswith('}'):
+            name = key[1:-1]
+            expanded[f"{{{{{name}}}}}"] = value
+    return expanded
+
+
 def generate_debt_text(claim_data: dict) -> str:
     """
-    Генерирует текст о стоимости услуг.
+    Форматирует сумму задолженности для вставки в шаблон.
 
     Args:
         claim_data: Данные о требованиях
 
     Returns:
-        Текст о стоимости услуг
+        Сумма задолженности в формате строки
     """
-    debt_amount = claim_data.get('debt', '0')
-    return f"Стоимость услуг по Договору составила {debt_amount} рублей."
+    debt_amount = parse_amount(claim_data.get('debt', '0'))
+    return f"{debt_amount:,.0f}".replace(',', ' ')
 
 
 def generate_payment_terms(claim_data: dict) -> str:
     """
     Генерирует текст о порядке оплаты по приоритету:
-    1. Если в payment_terms есть и дни, и дата — возвращает payment_terms
+    1. Если в payment_terms есть текст — возвращает payment_terms
     2. Если есть только дата — возвращает строку с датой
     3. Если есть только дни — возвращает строку с днями
     4. Если ничего нет — стандартный текст
@@ -275,20 +520,22 @@ def generate_payment_terms(claim_data: dict) -> str:
     payment_due_date = claim_data.get('payment_due_date')
     payment_terms = claim_data.get('payment_terms', '')
 
-    # Если в тексте требования явно есть оба — используем их как есть
-    if payment_terms and payment_days and payment_due_date:
-        return payment_terms
+    # Если в тексте требования явно есть условия — используем их как есть
+    if payment_terms:
+        return normalize_payment_terms(payment_terms)
     # Если есть только дата
     if payment_due_date and not payment_days:
-        return f"Срок оплаты не позднее {payment_due_date} г."
+        return normalize_payment_terms(
+            f"Срок оплаты не позднее {payment_due_date} г."
+        )
     # Если есть только дни
     if payment_days and not payment_due_date:
-        return (
+        return normalize_payment_terms(
             f"Оплата производится в течение {payment_days} банковских дней "
             "безналичным расчетом после получения оригиналов документов."
         )
     # Если ничего нет — стандарт
-    return (
+    return normalize_payment_terms(
         "Оплата производится безналичным расчетом после получения "
         "оригиналов документов."
     )
@@ -324,36 +571,157 @@ def replace_placeholders_robust(doc, replacements):
             replacements.get('{defendant_name}', ''))
     )
 
+    def is_missing(value: object) -> bool:
+        if value is None:
+            return True
+        text = str(value).strip()
+        return not text or text == 'Не указано'
+
+    def split_list_values(value: object) -> list:
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple)):
+            items = [str(item).strip() for item in value if str(item).strip()]
+            return items
+        text = str(value).strip()
+        if not text or text == 'Не указано':
+            return []
+        return [part.strip() for part in re.split(r'[;,]', text) if part.strip()]
+
+    def count_list_items(value: object) -> int:
+        return len(split_list_values(value))
+
+    def normalize_track_item(item: str) -> str:
+        cleaned = re.sub(r'^[№\s]+', '', item)
+        return cleaned.strip()
+
+    def format_track_phrase(value: object) -> str:
+        items = [normalize_track_item(item) for item in split_list_values(value)]
+        if not items:
+            return ''
+        label = 'трек номерами' if len(items) > 1 else 'трек номером'
+        return f"с {label} № {', '.join(items)}"
+
+    def format_received_verb(track_value: object, date_value: object) -> str:
+        count = max(
+            count_list_items(track_value),
+            count_list_items(date_value)
+        )
+        return 'получены' if count > 1 else 'получен'
+
     for paragraph in doc.paragraphs:
         full_text = ''.join(run.text for run in paragraph.runs)
+        original_alignment = paragraph.alignment
+        text_changed = False
+        skip_replacements = False
+
+        # Удаляем строку про оригиналы, если нет трек-номера или даты получения
+        if 'Оригиналы документов' in full_text:
+            track_value = replacements.get(
+                '{docs_track_number}',
+                replacements.get('{{docs_track_number}}', '')
+            )
+            date_value = replacements.get(
+                '{docs_received_date}',
+                replacements.get('{{docs_received_date}}', '')
+            )
+            if is_missing(track_value) or is_missing(date_value):
+                p = paragraph._element
+                p.getparent().remove(p)
+                continue
+            track_items = [
+                normalize_track_item(item)
+                for item in split_list_values(track_value)
+            ]
+            date_items = split_list_values(date_value)
+            if track_items and date_items and len(track_items) == len(date_items):
+                if len(track_items) == 1:
+                    full_text = (
+                        "Оригиналы документов по перевозкам отправлялись "
+                        "почтовым отправлением "
+                        f"с трек номером № {track_items[0]} "
+                        f"получен {date_items[0]}."
+                    )
+                else:
+                    pairs = [
+                        f"№ {track} (получен {date})"
+                        for track, date in zip(track_items, date_items)
+                    ]
+                    full_text = (
+                        "Оригиналы документов по перевозкам отправлялись "
+                        "почтовым отправлением "
+                        f"с трек номерами {', '.join(pairs)}."
+                    )
+            else:
+                full_text = (
+                    "Оригиналы документов по перевозкам отправлялись почтовым "
+                    f"отправлением {format_track_phrase(track_value)} "
+                    f"{format_received_verb(track_value, date_value)} "
+                    f"{str(date_value).strip()}."
+                )
+            text_changed = True
+            skip_replacements = True
 
         # Удаляем строки с КПП для ИП
-        if is_plaintiff_ip and 'КПП' in full_text and '{plaintiff_kpp}' in full_text:
+        if (
+            is_plaintiff_ip
+            and 'КПП' in full_text
+            and ('{plaintiff_kpp}' in full_text or '{{plaintiff_kpp}}' in full_text)
+        ):
+            before_kpp = full_text
             lines = full_text.split('\n')
             filtered_lines = []
             for line in lines:
-                if not ('КПП' in line and '{plaintiff_kpp}' in line):
+                if not (
+                    'КПП' in line
+                    and ('{plaintiff_kpp}' in line or '{{plaintiff_kpp}}' in line)
+                ):
                     filtered_lines.append(line)
             full_text = '\n'.join(filtered_lines)
+            if full_text != before_kpp:
+                text_changed = True
 
-        if is_defendant_ip and 'КПП' in full_text and '{defendant_kpp}' in full_text:
+        if (
+            is_defendant_ip
+            and 'КПП' in full_text
+            and ('{defendant_kpp}' in full_text or '{{defendant_kpp}}' in full_text)
+        ):
+            before_kpp = full_text
             lines = full_text.split('\n')
             filtered_lines = []
             for line in lines:
-                if not ('КПП' in line and '{defendant_kpp}' in line):
+                if not (
+                    'КПП' in line
+                    and ('{defendant_kpp}' in line or '{{defendant_kpp}}' in line)
+                ):
                     filtered_lines.append(line)
             full_text = '\n'.join(filtered_lines)
+            if full_text != before_kpp:
+                text_changed = True
 
-        replaced = False
-        for key, value in replacements.items():
-            if key in full_text:
-                replaced = True
-                clean_value = str(value).replace(
-                    '\n', ' ').replace('\r', ' ').strip()
-                full_text = full_text.replace(key, clean_value)
-        if replaced:
+        if not skip_replacements:
+            replaced_any = False
+            for key in sorted(replacements.keys(), key=len, reverse=True):
+                if key in full_text:
+                    replaced_any = True
+                    value = replacements[key]
+                    if key.strip('{}') == 'documents_list':
+                        clean_value = str(value).replace('\r', '').strip()
+                    else:
+                        clean_value = str(value).replace(
+                            '\n', ' ').replace('\r', ' ').strip()
+                    full_text = full_text.replace(key, clean_value)
+            if replaced_any:
+                text_changed = True
+
+        if text_changed:
+            if not full_text.strip():
+                p = paragraph._element
+                p.getparent().remove(p)
+                continue
             paragraph.clear()
-            paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            if original_alignment is not None:
+                paragraph.alignment = original_alignment
             # Проверяем, должна ли строка быть жирной
             is_bold = False
             for bold_line in bold_lines:
@@ -367,7 +735,10 @@ def replace_placeholders_robust(doc, replacements):
                 if len(parts) > 1:
                     # Первая часть (обычно "В")
                     if parts[0].strip():
-                        run = paragraph.add_run(parts[0].strip())
+                        prefix = parts[0]
+                        if not prefix.endswith(' '):
+                            prefix += ' '
+                        run = paragraph.add_run(prefix)
                         run.font.name = 'Times New Roman'
                         run.font.size = Pt(12)
                         run.bold = False
@@ -414,68 +785,195 @@ def replace_attachments_with_paragraphs(doc, attachments):
     """
     import logging
     idx = None
+    add_header = True
+    parent = None
+    placeholders = ['{attachments}', '{{attachments}}']
     for i, paragraph in enumerate(doc.paragraphs):
-        if '{attachments}' in paragraph.text:
+        if any(ph in paragraph.text for ph in placeholders):
             idx = i
+            parent = paragraph._element.getparent()
             break
 
+    if idx is None:
+        for i, paragraph in enumerate(doc.paragraphs):
+            if paragraph.text.strip() == "Приложения:":
+                idx = i + 1
+                parent = paragraph._element.getparent()
+                add_header = False
+                break
+
     if idx is not None:
-        # Удаляем параграф с плейсхолдером
-        p = doc.paragraphs[idx]._element
-        parent = p.getparent()
-        parent.remove(p)
+        if add_header:
+            # Удаляем параграф с плейсхолдером
+            p = doc.paragraphs[idx]._element
+            parent.remove(p)
 
-        # Добавляем заголовок "Приложения:"
-        new_par = doc.add_paragraph()
-        run = new_par.add_run("Приложения:")
-        run.font.name = 'Times New Roman'
-        run.font.size = Pt(12)
-        run.bold = True
-        new_par.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        parent.insert(idx, new_par._element)
-        idx += 1
-
-        # Ключевые слова для жирного
-        bold_keywords = [
-            "Заявка", "Счет", "УПД", "Акт", "Комплект сопроводительных документов"
-        ]
-
-        # Динамические приложения с нумерацией
-        attachment_number = 1
-        for att in attachments:
-            att_clean = fix_number_spacing(att.rstrip(';').strip())
+            # Добавляем заголовок "Приложения:"
             new_par = doc.add_paragraph()
-            # Проверяем, нужно ли выделять жирным
-            is_bold = any(att_clean.startswith(word) for word in bold_keywords)
-            run = new_par.add_run(f"{attachment_number}. {att_clean};")
+            run = new_par.add_run("Приложения:")
             run.font.name = 'Times New Roman'
             run.font.size = Pt(12)
-            run.bold = is_bold
+            run.bold = True
             new_par.alignment = WD_ALIGN_PARAGRAPH.LEFT
             parent.insert(idx, new_par._element)
             idx += 1
-            attachment_number += 1
+        else:
+            # Удаляем старый список приложений из шаблона
+            while idx < len(doc.paragraphs):
+                paragraph = doc.paragraphs[idx]
+                text = paragraph.text.strip()
+                if not text:
+                    p = paragraph._element
+                    parent.remove(p)
+                    continue
+                if (
+                    "{{plaintiff_name_short}}" in text
+                    or "{plaintiff_name_short}" in text
+                    or re.match(r"^_+", text)
+                ):
+                    break
+                p = paragraph._element
+                parent.remove(p)
 
-        # Статические приложения
-        static_attachments = [
-            "Документы, подтверждающие отправку искового заявления Ответчику – копия",
-            "Документы, подтверждающие оплату государственной пошлины – копия",
-            "Выписка из ЕГРЮЛ на Истца – электронная версия",
-            "Выписка из ЕГРЮЛ на Ответчика – электронная версия"
+        def normalize_attachment_text(value: str) -> str:
+            cleaned = value.lower().replace('ё', 'е')
+            cleaned = re.sub(r'[\s\.,;:–—-]+', ' ', cleaned)
+            return cleaned.strip()
+
+        base_attachments = []
+        for att in attachments:
+            if not att or str(att).strip() == "Не указано":
+                continue
+            att_clean = fix_number_spacing(str(att).rstrip(';').strip())
+            if att_clean:
+                base_attachments.append(att_clean)
+
+        extra_top = [
+            "Претензия – копия",
+            "Чек и опись об отправке требования – копия",
         ]
-        for static_att in static_attachments:
-            static_att = fix_number_spacing(static_att)
+        extra_tail = [
+            "Квитанция об уплате государственной пошлины",
+            "Документы, подтверждающие отправку искового заявления Ответчику - копия",
+            "Доверенность на представителя – копия",
+        ]
+
+        final_attachments = []
+        seen = set()
+
+        def add_unique(item: str) -> None:
+            key = normalize_attachment_text(item)
+            if not key or key in seen:
+                return
+            seen.add(key)
+            final_attachments.append(item)
+
+        for item in extra_top:
+            add_unique(item)
+        for item in base_attachments:
+            add_unique(item)
+        for item in extra_tail:
+            add_unique(item)
+
+        # Динамические приложения с нумерацией
+        attachment_number = 1
+        for att in final_attachments:
             new_par = doc.add_paragraph()
-            run = new_par.add_run(f"{attachment_number}. {static_att};")
+            run = new_par.add_run(f"{attachment_number}. {att};")
             run.font.name = 'Times New Roman'
             run.font.size = Pt(12)
             run.bold = False
-            new_par.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            new_par.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
             parent.insert(idx, new_par._element)
             idx += 1
             attachment_number += 1
     else:
-        logging.warning("Плейсхолдер {attachments} не найден в документе")
+        if attachments and attachments != ["Не указано"]:
+            logging.warning(
+                "Плейсхолдер {attachments} или блок 'Приложения:' не найден"
+            )
+
+
+def replace_documents_list_with_paragraphs(
+    doc,
+    structured_items: List[Tuple[int, str]]
+) -> bool:
+    """
+    Заменяет {documents_list} на список параграфов с отступами.
+    """
+    placeholders = ['{documents_list}', '{{documents_list}}']
+    idx = None
+    for i, paragraph in enumerate(doc.paragraphs):
+        if any(ph in paragraph.text for ph in placeholders):
+            idx = i
+            break
+
+    if idx is None:
+        return False
+
+    p = doc.paragraphs[idx]._element
+    parent = p.getparent()
+    parent.remove(p)
+
+    for level, text in structured_items:
+        line = text.strip()
+        if not line:
+            continue
+        if level > 0 and not line.startswith(('-', '–', '—', '•')):
+            line = f"• {line}"
+        new_par = doc.add_paragraph()
+        run = new_par.add_run(line)
+        run.font.name = 'Times New Roman'
+        run.font.size = Pt(12)
+        new_par.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        if level > 0:
+            new_par.paragraph_format.left_indent = Pt(18)
+            new_par.paragraph_format.first_line_indent = Pt(-9)
+        parent.insert(idx, new_par._element)
+        idx += 1
+
+    return True
+
+
+def number_attachments_section(doc):
+    """
+    Добавляет нумерацию к списку приложений в шаблоне,
+    если он указан как отдельные строки без номеров.
+    """
+    start_idx = None
+    for i, paragraph in enumerate(doc.paragraphs):
+        if paragraph.text.strip() == "Приложения:":
+            start_idx = i + 1
+            break
+    if start_idx is None:
+        return
+
+    number = 1
+    for i in range(start_idx, len(doc.paragraphs)):
+        paragraph = doc.paragraphs[i]
+        text = paragraph.text.strip()
+        if not text:
+            break
+        if (
+            "{{plaintiff_name_short}}" in text
+            or "{plaintiff_name_short}" in text
+            or re.match(r"^_+", text)
+        ):
+            break
+        if re.match(r"^\d+[.)]\s+", text):
+            number += 1
+            continue
+
+        cleaned = re.sub(r"^[-–—]\s*", "", text).strip()
+        original_alignment = paragraph.alignment
+        paragraph.clear()
+        if original_alignment is not None:
+            paragraph.alignment = original_alignment
+        run = paragraph.add_run(f"{number}. {cleaned}")
+        run.font.name = 'Times New Roman'
+        run.font.size = Pt(12)
+        run.bold = False
+        number += 1
 
 
 def format_organization_name_short(full_name: str) -> str:
@@ -579,17 +1077,57 @@ def create_isk_document(
     data: dict,
     interest_data: dict,
     duty_data: dict,
-    replacements: dict
+    replacements: dict,
+    documents_list_structured: Optional[List[Tuple[int, str]]] = None,
+    output_path: Optional[str] = None
 ) -> str:
-    doc = Document('template.docx')
-    replace_placeholders_robust(doc, replacements)
-    replace_attachments_with_paragraphs(doc, data.get('attachments', []))
-    insert_interest_table(doc, interest_data['details'])
-    result_docx = os.path.join(
-        os.path.dirname(__file__), 'Исковое_заявление.docx'
+    template_dir = os.path.dirname(__file__)
+    primary_template = os.path.join(template_dir, 'template_isk.docx')
+    fallback_template = os.path.join(template_dir, 'template.docx')
+    if os.path.exists(primary_template):
+        template_path = primary_template
+    else:
+        logging.warning(
+            "Шаблон template_isk.docx не найден, используется template.docx"
+        )
+        template_path = fallback_template
+    doc = Document(template_path)
+    replacements = replacements.copy()
+    if documents_list_structured:
+        inserted = replace_documents_list_with_paragraphs(
+            doc,
+            documents_list_structured
+        )
+        if inserted:
+            replacements.pop('{documents_list}', None)
+            replacements.pop('{{documents_list}}', None)
+    replace_placeholders_robust(doc, expand_placeholder_map(replacements))
+    attachment_placeholders = ['{attachments}', '{{attachments}}']
+    has_attachment_placeholder = any(
+        ph in paragraph.text
+        for paragraph in doc.paragraphs
+        for ph in attachment_placeholders
     )
-    doc.save(result_docx)
-    return result_docx
+    has_attachments_header = any(
+        paragraph.text.strip() == "Приложения:"
+        for paragraph in doc.paragraphs
+    )
+    if has_attachment_placeholder or has_attachments_header:
+        replace_attachments_with_paragraphs(
+            doc,
+            data.get('attachments', [])
+        )
+    number_attachments_section(doc)
+    insert_interest_table(
+        doc,
+        interest_data.get('detailed_calc', []),
+        interest_data.get('total_interest')
+    )
+    if output_path is None:
+        output_name = f"Исковое_заявление_{uuid.uuid4().hex}.docx"
+        output_path = os.path.join(os.path.dirname(__file__), output_name)
+    doc.save(output_path)
+    return output_path
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -681,20 +1219,38 @@ async def finish_claim(update, context):
     doc = Document(file_path)
     text = "\n".join(p.text for p in doc.paragraphs)
 
-    # Используем только новый парсер
+    # Используем sliding window парсер
     claim_data = parse_documents_with_sliding_window(text)
+    claim_data = apply_llm_fallback(text, claim_data)
 
     claim_data['claim_number'] = context.user_data.get('claim_number', '')
     claim_data['claim_date'] = context.user_data.get('claim_date', '')
     key_rates = get_key_rates_from_395gk()
-    interest_data = calculate_full_395(
-        file_path, key_rates=key_rates
-    )
+    try:
+        interest_data = calculate_full_395(
+            file_path, key_rates=key_rates
+        )
+    except Exception as exc:
+        logging.error(
+            "Ошибка расчета процентов: %s",
+            exc,
+            exc_info=True
+        )
+        interest_data = {
+            'total_interest': 0.0,
+            'detailed_calc': [],
+            'error': str(exc)
+        }
+    if interest_data.get('error') and update.message:
+        await update.message.reply_text(
+            "⚠️ Не удалось найти таблицу расчета процентов. "
+            "Продолжаю без процентов."
+        )
 
     # Получаем сумму долга из нового парсера
-    debt_amount = float(claim_data.get(
-        'debt', '0').replace(' ', '').replace(',', '.'))
-    total_claim = debt_amount + interest_data['total_interest']
+    debt_amount = parse_amount(claim_data.get('debt', '0'))
+    total_interest = parse_amount(interest_data.get('total_interest', 0.0))
+    total_claim = debt_amount + total_interest
 
     duty_data = calculate_duty(total_claim)
     if 'error' in duty_data:
@@ -705,8 +1261,8 @@ async def finish_claim(update, context):
             context.user_data[key] = ''
 
     # Используем данные из нового парсера для истца и ответчика
-    plaintiff_name = claim_data.get('plaintiff_name', 'Не указано')
-    defendant_name = claim_data.get('defendant_name', 'Не указано')
+    plaintiff_name = normalize_str(claim_data.get('plaintiff_name'))
+    defendant_name = normalize_str(claim_data.get('defendant_name'))
     contract_parties = claim_data.get('contract_parties', '')
     contract_parties_short = claim_data.get('contract_parties_short', '')
 
@@ -717,12 +1273,42 @@ async def finish_claim(update, context):
     # Форматируем имена для использования в тексте (короткие названия)
     plaintiff_name_short = format_organization_name_short(plaintiff_name)
     defendant_name_short = format_organization_name_short(defendant_name)
+    plaintiff_ogrn_type = get_ogrn_label(
+        plaintiff_name,
+        claim_data.get('plaintiff_inn', '')
+    )
 
+    # Получаем информацию о подсудности из контекста
+    jurisdiction_info = context.user_data.get('jurisdiction_info')
+    if jurisdiction_info:
+        court_name = jurisdiction_info.court_name
+        court_address = jurisdiction_info.court_address
+    else:
+        # Fallback на старую логику
+        court_name, court_address = get_court_by_address(
+            claim_data.get('defendant_address', 'Не указано')
+        )
+
+    legal_fees_value = parse_amount(claim_data.get('legal_fees', '0'))
+    docs_track_number = join_list_values(
+        claim_data.get('postal_numbers', [])
+    ) or context.user_data.get('claim_number', '')
+    docs_received_date = join_list_values(
+        claim_data.get('postal_dates', [])
+    ) or context.user_data.get('postal_receive_date', '')
+    documents_list_structured = extract_documents_list_structure(text)
+    documents_list = build_documents_list(claim_data)
+    plaintiff_birth_info = normalize_str(
+        claim_data.get('plaintiff_birth_info'),
+        default='' if not is_plaintiff_ip else 'Не указано'
+    )
     replacements = {
         '{claim_paragraph}': generate_claim_paragraph(
             context.user_data
         ),
-        '{postal_block}': format_document_list(claim_data.get('postal_block', '')),
+        '{postal_block}': format_document_list(
+            claim_data.get('postal_block', 'Не указано')
+        ),
         '{postal_numbers_all}': (
             ', '.join(claim_data.get('postal_numbers', []))
             or 'Не указано'
@@ -731,24 +1317,29 @@ async def finish_claim(update, context):
             ', '.join(claim_data.get('postal_dates', []))
             or 'Не указано'
         ),
-        '{court_name}': get_court_by_address(claim_data.get('defendant_address', 'Не указано'))[0],
-        '{court_address}': get_court_by_address(claim_data.get('defendant_address', 'Не указано'))[1],
+        '{court_name}': court_name,
+        '{court_address}': court_address,
         '{plaintiff_name}': plaintiff_name,
         '{plaintiff_name_short}': plaintiff_name_short,
         '{plaintiff_name_formatted}': plaintiff_name_short,
-        '{plaintiff_inn}': claim_data.get('plaintiff_inn', 'Не указано'),
-        '{plaintiff_kpp}': '' if is_plaintiff_ip else claim_data.get('plaintiff_kpp', 'Не указано'),
-        '{plaintiff_ogrn}': claim_data.get('plaintiff_ogrn', 'Не указано'),
-        '{plaintiff_address}': claim_data.get('plaintiff_address', 'Не указано').replace('\n', ' ').strip(),
+        '{plaintiff_inn}': normalize_str(claim_data.get('plaintiff_inn')),
+        '{plaintiff_kpp}': '' if is_plaintiff_ip else normalize_str(claim_data.get('plaintiff_kpp')),
+        '{plaintiff_ogrn}': normalize_str(claim_data.get('plaintiff_ogrn')),
+        '{plaintiff_address}': normalize_str(
+            claim_data.get('plaintiff_address')
+        ).replace('\n', ' ').strip(),
         '{defendant_name}': defendant_name,
         '{defendant_name_short}': defendant_name_short,
-        '{defendant_inn}': claim_data.get('defendant_inn', 'Не указано'),
-        '{defendant_kpp}': '' if is_defendant_ip else claim_data.get('defendant_kpp', 'Не указано'),
-        '{defendant_ogrn}': claim_data.get('defendant_ogrn', 'Не указано'),
-        '{defendant_address}': claim_data.get('defendant_address', 'Не указано').replace('\n', ' ').strip(),
+        '{defendant_inn}': normalize_str(claim_data.get('defendant_inn')),
+        '{defendant_kpp}': '' if is_defendant_ip else normalize_str(claim_data.get('defendant_kpp')),
+        '{defendant_ogrn}': normalize_str(claim_data.get('defendant_ogrn')),
+        '{defendant_address}': normalize_str(
+            claim_data.get('defendant_address')
+        ).replace('\n', ' ').strip(),
         '{contract_parties}': contract_parties,
         '{contract_parties_short}': contract_parties_short,
         '{total_claim}': f"{total_claim:,.2f}".replace(',', ' '),
+        '{claim_total}': f"{total_claim:,.2f}".replace(',', ' '),
         '{duty}': f"{duty_data['duty']:,.0f}".replace(',', ' '),
         '{debt}': generate_debt_text(claim_data),
         '{payment_terms}': generate_payment_terms(claim_data),
@@ -759,27 +1350,54 @@ async def finish_claim(update, context):
         '{upd_blocks}': format_document_list(claim_data.get('upd_blocks', '')),
         '{invoices}': claim_data.get('invoice_blocks', 'Не указано'),
         '{upds}': claim_data.get('upd_blocks', 'Не указано'),
-        '{claim_date}': context.user_data.get('claim_date', ''),
-        '{claim_number}': context.user_data.get('claim_number', ''),
-        '{total_interest}': f"{interest_data['total_interest']:,.2f}".replace(',', ' '),
-        '{legal_fees}': f"{float(claim_data.get('legal_fees', '0').replace(' ', '')):,.2f}".replace(',', ' '),
+        '{claim_date}': normalize_str(context.user_data.get('claim_date', '')),
+        '{claim_number}': normalize_str(context.user_data.get('claim_number', '')),
+        '{claim_track_number}': normalize_str(
+            context.user_data.get('claim_number', '')
+        ),
+        '{docs_track_number}': normalize_str(docs_track_number),
+        '{docs_received_date}': normalize_str(docs_received_date),
+        '{documents_list}': documents_list,
+        '{total_interest}': f"{total_interest:,.2f}".replace(',', ' '),
+        '{legal_fees}': f"{legal_fees_value:,.2f}".replace(',', ' '),
+        '{legal_fee}': f"{legal_fees_value:,.2f}".replace(',', ' '),
+        '{legal_contract_number}': normalize_str(
+            claim_data.get('legal_contract_number')
+        ),
+        '{legal_contract_date}': normalize_str(
+            claim_data.get('legal_contract_date')
+        ),
+        '{legal_payment_number}': normalize_str(
+            claim_data.get('legal_payment_number')
+        ),
+        '{legal_payment_date}': normalize_str(
+            claim_data.get('legal_payment_date')
+        ),
         '{total_expenses}': (
-            f"{float(str(duty_data['duty'])) + float(claim_data.get('legal_fees', '0').replace(' ', '')):,.0f}".replace(
-                ',', ' ')
+            f"{float(str(duty_data['duty'])) + legal_fees_value:,.0f}"
+            .replace(',', ' ')
         ),
         '{calculation_date}': datetime.today().strftime('%d.%m.%Y г.'),
-        '{signatory}': claim_data.get('signatory', 'Не указано').replace('\n', ' ').strip(),
-        '{signature_block}': claim_data.get('signature_block', 'Не указано'),
-        '{postal_numbers}': (
-            context.user_data.get('claim_number', '') or 'Не указано'
+        '{signatory}': normalize_str(
+            claim_data.get('signatory')
+        ).replace('\n', ' ').strip(),
+        '{signature_block}': normalize_str(claim_data.get('signature_block')),
+        '{postal_numbers}': normalize_str(
+            context.user_data.get('claim_number', '')
         ),
-        '{postal_receive_date}': (
-            context.user_data.get('postal_receive_date', '') or 'Не указано'
+        '{postal_receive_date}': normalize_str(
+            context.user_data.get('postal_receive_date', '')
         ),
         '{payment_days}': claim_data.get('payment_days', 'Не указано'),
+        '{plaintiff_ogrn_type}': plaintiff_ogrn_type,
+        '{plaintiff_birth_info}': plaintiff_birth_info,
     }
     result_docx = create_isk_document(
-        claim_data, interest_data, duty_data, replacements
+        claim_data,
+        interest_data,
+        duty_data,
+        replacements,
+        documents_list_structured=documents_list_structured
     )
     with open(result_docx, 'rb') as f:
         await update.message.reply_document(
@@ -789,10 +1407,193 @@ async def finish_claim(update, context):
     try:
         if os.path.exists(file_path):
             os.remove(file_path)
+        if os.path.exists(result_docx):
+            os.remove(result_docx)
     except Exception as e:
         logging.warning(
             f"Не удалось удалить файл {file_path}: {e}"
         )
+
+
+async def ask_jurisdiction(update, context):
+    """
+    Спрашивает пользователя о подсудности спора.
+    """
+    from jurisdiction import JurisdictionDetector, format_jurisdiction_for_user
+
+    file_path = context.user_data.get('file_path')
+    if not file_path or not os.path.exists(file_path):
+        await update.message.reply_text('Ошибка: файл не найден.')
+        return ConversationHandler.END
+
+    # Извлекаем текст из документа
+    doc = Document(file_path)
+    text = "\n".join(p.text for p in doc.paragraphs)
+
+    # Парсим базовые данные для определения адресов
+    claim_data = parse_documents_with_sliding_window(text)
+    claim_data = apply_llm_fallback(text, claim_data)
+    defendant_address = claim_data.get('defendant_address', 'Не указано')
+
+    # Определяем подсудность
+    detector = JurisdictionDetector()
+    jurisdiction_info = detector.detect_jurisdiction(
+        text=text,
+        defendant_address=defendant_address
+    )
+
+    # Сохраняем в контекст
+    context.user_data['jurisdiction_info'] = jurisdiction_info
+    context.user_data['claim_data'] = claim_data
+
+    # Формируем сообщение для пользователя
+    info_text = format_jurisdiction_for_user(jurisdiction_info)
+
+    # Кнопки для выбора
+    keyboard = []
+
+    if jurisdiction_info.confidence > 0.7:
+        # Высокая уверенность - предлагаем подтвердить
+        keyboard.append([
+            InlineKeyboardButton("✅ Верно", callback_data='jurisdiction_confirm')
+        ])
+
+    keyboard.extend([
+        [InlineKeyboardButton("📝 Указать другой суд", callback_data='jurisdiction_custom')],
+        [InlineKeyboardButton("❓ По месту ответчика (по умолчанию)", callback_data='jurisdiction_default')]
+    ])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    message = (
+        "🏛 *Определение подсудности*\n\n"
+        f"{info_text}\n\n"
+        "Подсудность определена верно?"
+    )
+
+    await update.message.reply_text(
+        message,
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+    return ASK_JURISDICTION
+
+
+async def jurisdiction_chosen(update, context):
+    """
+    Обрабатывает выбор пользователя по подсудности.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    choice = query.data
+
+    if choice == 'jurisdiction_confirm':
+        # Подтверждено - переходим к вопросам о претензии
+        await query.edit_message_text(
+            "✅ Подсудность подтверждена.\n\nТеперь ответьте на вопросы о претензии."
+        )
+        return await ask_claim_status_after_jurisdiction(query, context)
+
+    elif choice == 'jurisdiction_default':
+        # Используем подсудность по умолчанию
+        from jurisdiction import JurisdictionDetector
+
+        claim_data = context.user_data.get('claim_data', {})
+        defendant_address = claim_data.get('defendant_address', 'Не указано')
+
+        detector = JurisdictionDetector()
+        jurisdiction_info = detector._get_default_jurisdiction(defendant_address)
+        context.user_data['jurisdiction_info'] = jurisdiction_info
+
+        await query.edit_message_text(
+            f"✅ Используется подсудность по месту ответчика.\n\n"
+            f"Суд: {jurisdiction_info.court_name}\n\n"
+            "Теперь ответьте на вопросы о претензии."
+        )
+        return await ask_claim_status_after_jurisdiction(query, context)
+
+    elif choice == 'jurisdiction_custom':
+        # Запрашиваем ручной ввод суда
+        await query.edit_message_text(
+            "Введите название суда (например: Арбитражный суд Московской области):"
+        )
+        return ASK_CUSTOM_COURT
+
+
+async def handle_custom_court(update, context):
+    """
+    Обрабатывает ручной ввод названия суда.
+    """
+    from jurisdiction import JurisdictionDetector, JurisdictionInfo, JurisdictionType
+
+    custom_court = update.message.text.strip()
+    detector = JurisdictionDetector()
+
+    # Пытаемся найти суд в базе
+    region = custom_court.replace('Арбитражный суд', '').strip()
+    court_info_dict = detector._find_court_by_region(region)
+
+    if court_info_dict:
+        jurisdiction_info = JurisdictionInfo(
+            type=JurisdictionType.CUSTOM,
+            court_name=court_info_dict['name'],
+            court_address=court_info_dict['address'],
+            confidence=1.0
+        )
+        context.user_data['jurisdiction_info'] = jurisdiction_info
+
+        await update.message.reply_text(
+            f"✅ Суд установлен:\n{court_info_dict['name']}\n\n"
+            "Теперь ответьте на вопросы о претензии."
+        )
+    else:
+        # Не нашли в базе - сохраняем как есть
+        jurisdiction_info = JurisdictionInfo(
+            type=JurisdictionType.CUSTOM,
+            court_name=custom_court,
+            court_address="Уточните адрес суда",
+            confidence=0.5
+        )
+        context.user_data['jurisdiction_info'] = jurisdiction_info
+
+        await update.message.reply_text(
+            f"⚠️ Суд не найден в базе. Использую введенное название:\n{custom_court}\n\n"
+            "Не забудьте проверить адрес суда в готовом документе!\n\n"
+            "Теперь ответьте на вопросы о претензии."
+        )
+
+    return await ask_claim_status_after_jurisdiction(update, context)
+
+
+async def ask_claim_status_after_jurisdiction(update_or_query, context):
+    """
+    Переход к вопросам о претензии после определения подсудности.
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Да", callback_data='claim_received'),
+            InlineKeyboardButton("❌ Нет", callback_data='claim_not_received'),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    # Определяем, откуда пришел вызов
+    if hasattr(update_or_query, 'message') and update_or_query.message:
+        # Это обычный update с message
+        await update_or_query.message.reply_text(
+            "Ответчик получил требование?",
+            reply_markup=reply_markup
+        )
+    else:
+        # Это callback query
+        await update_or_query.message.reply_text(
+            "Ответчик получил требование?",
+            reply_markup=reply_markup
+        )
+
+    return ASK_CLAIM_STATUS
 
 
 async def handle_doc_entry(update, context):
@@ -835,7 +1636,8 @@ async def handle_doc_entry(update, context):
             "Saved file_path in user_data: %s",
             file_path
         )
-        return await ask_claim_status(update, context)
+        # ИЗМЕНЕНО: теперь сначала спрашиваем о подсудности
+        return await ask_jurisdiction(update, context)
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
@@ -849,12 +1651,23 @@ async def handle_doc_entry(update, context):
 conv_handler = ConversationHandler(
     entry_points=[MessageHandler(filters.Document.ALL, handle_doc_entry)],
     states={
+        ASK_JURISDICTION: [CallbackQueryHandler(jurisdiction_chosen)],
+        ASK_CUSTOM_COURT: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_custom_court)
+        ],
         ASK_CLAIM_STATUS: [CallbackQueryHandler(claim_status_chosen)],
-        ASK_TRACK: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_track)],
-        ASK_RECEIVE_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_receive_date)],
-        ASK_SEND_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_send_date)],
+        ASK_TRACK: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, ask_track)
+        ],
+        ASK_RECEIVE_DATE: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, ask_receive_date)
+        ],
+        ASK_SEND_DATE: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, ask_send_date)
+        ],
     },
     fallbacks=[],
+    per_message=False,
 )
 
 
@@ -898,7 +1711,7 @@ def main() -> None:
     """Запускает Telegram бота."""
     logging.info("Starting bot...")
     clean_uploads_folder()  # Очищаем uploads при запуске
-    if TOKEN is None:
+    if not TOKEN:
         logging.error(
             "TOKEN is not set. Please provide a valid Telegram bot token."
         )

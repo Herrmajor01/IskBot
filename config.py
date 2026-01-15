@@ -2,8 +2,12 @@
 Конфигурационный файл для IskBot.
 """
 
+import json
+import logging
 import os
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 # Настройки бота
 BOT_CONFIG = {
@@ -35,7 +39,7 @@ CALCULATION_CONFIG = {
 }
 
 # База судов (расширенная)
-COURTS_DATABASE = {
+COURTS_DATABASE_FALLBACK = {
     'Москва': {
         'name': 'Арбитражный суд города Москвы',
         'address': '115191, г. Москва, ул. Большая Тульская, д. 17'
@@ -372,6 +376,29 @@ COURTS_DATABASE = {
         'address': '629000, г. Салехард, ул. Республики, д. 72'
     }
 }
+
+
+def load_courts_database(
+    path: Optional[str] = None
+) -> Dict[str, Dict[str, str]]:
+    if path is None:
+        path = os.path.join(os.path.dirname(__file__), 'courts_database.json')
+    try:
+        with open(path, 'r', encoding='utf-8') as handle:
+            data = json.load(handle)
+        if not isinstance(data, dict):
+            raise ValueError("Некорректный формат courts_database.json")
+        return data
+    except Exception as exc:
+        logger.warning(
+            "Не удалось загрузить courts_database.json, "
+            "используется резервная база: %s",
+            exc
+        )
+        return COURTS_DATABASE_FALLBACK
+
+
+COURTS_DATABASE = load_courts_database()
 
 # Паттерны для парсинга
 PARSING_PATTERNS = {

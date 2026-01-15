@@ -3,6 +3,8 @@
 для определения арбитражного суда по адресу ответчика.
 """
 
+from config import COURTS_DATABASE
+
 # Словарь соответствия городов регионам
 CITY_TO_REGION = {
     # Республики
@@ -107,7 +109,7 @@ CITY_TO_REGION = {
 }
 
 # Словарь арбитражных судов с актуальными адресами
-ARBITRATION_COURTS = {
+ARBITRATION_COURTS_FALLBACK = {
     "Крым": {
         "name": "Арбитражный суд Республики Крым",
         "address": (
@@ -664,3 +666,5 @@ ARBITRATION_COURTS = {
         )
     }
 }
+
+ARBITRATION_COURTS = COURTS_DATABASE or ARBITRATION_COURTS_FALLBACK

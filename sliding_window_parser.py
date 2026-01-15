@@ -112,6 +112,11 @@ class SlidingWindowParser:
                 'курьерского уведомления',
                 'почтовая квитанция', 'почтовые квитанции',
                 'почтовой квитанции'
+            ],
+            'contracts': [
+                'договор', 'договора', 'договору', 'договором', 'договоре',
+                'договоры', 'договоров', 'договорам', 'договорами', 'договорах',
+                'договор перевозки', 'договор транспортной экспедиции'
             ]
         }
 
@@ -129,7 +134,8 @@ class SlidingWindowParser:
             'invoice_blocks': 'счет на оплату',
             'upd_blocks': 'УПД',
             'cargo_docs': 'накладная',
-            'postal_block': 'почтовое уведомление'
+            'postal_block': 'почтовое уведомление',
+            'contracts': 'договор'
         }
 
     def tokenize_text(self, text: str) -> List[str]:
@@ -337,7 +343,8 @@ class SlidingWindowParser:
                    'defendant_ogrn': '',
                    'defendant_address': ''}
 
-        requirement_match = re.search(r'ТРЕБОВАНИЕ', text, re.IGNORECASE)
+        requirement_match = re.search(
+            r'(ТРЕБОВАНИЕ|ПРЕТЕНЗИЯ)', text, re.IGNORECASE)
         if not requirement_match:
             return parties
 
@@ -350,17 +357,31 @@ class SlidingWindowParser:
             line = line.strip()
             if not line:
                 continue
-            if line.startswith('Обществу'):
+            line_lower = line.lower()
+            if re.match(r'^кому\s*:', line_lower):
+                current_section = 'defendant'
+                content = re.sub(r'^кому\s*:\s*', '', line, flags=re.IGNORECASE)
+                self._parse_inline_party_line(content, defendant_data)
+                continue
+            elif re.match(r'^от\s+кого\s*:', line_lower):
+                current_section = 'plaintiff'
+                content = re.sub(r'^от\s+кого\s*:\s*', '', line, flags=re.IGNORECASE)
+                self._parse_inline_party_line(content, plaintiff_data)
+                continue
+            if line_lower.startswith('обществу'):
                 current_section = 'defendant'
                 defendant_name = self.convert_to_nominative(line)
                 defendant_data['name'] = defendant_name
                 continue
-            elif line.startswith('от'):
+            elif line_lower.startswith('от'):
                 current_section = 'plaintiff'
 
                 # Обработка ИП
                 ip_match = re.match(
-                    r'от\s+Индивидуального предпринимателя\s+(.+)', line)
+                    r'от\s+Индивидуального предпринимателя\s+(.+)',
+                    line,
+                    re.IGNORECASE
+                )
                 if ip_match:
                     fio = ip_match.group(1).strip()
                     fio_nom = self.convert_ip_fio_to_nominative(fio)
@@ -371,7 +392,9 @@ class SlidingWindowParser:
                 if 'Обществ' in line:
                     # Собираем название организации из текущей и следующих строк
                     # Убираем "от" из первой строки
-                    org_name_parts = [line.replace('от ', '')]
+                    org_name_parts = [
+                        re.sub(r'^от\s+', '', line, flags=re.IGNORECASE)
+                    ]
 
                     # Проверяем следующие строки на наличие названия организации
                     j = i + 1
@@ -501,6 +524,47 @@ class SlidingWindowParser:
             parties['contract_parties_short'] = f"Между {party1_short} и {party2_short}"
         return parties
 
+    def _parse_inline_party_line(self, content: str, data: Dict[str, str]) -> None:
+        inn_match = re.search(r'ИНН\s*(\d{10,12})', content, re.IGNORECASE)
+        kpp_match = re.search(r'КПП\s*(\d{9})', content, re.IGNORECASE)
+        if re.search(r'ОГРНИП', content, re.IGNORECASE):
+            ogrn_match = re.search(r'ОГРНИП\s*(\d{15})', content, re.IGNORECASE)
+        else:
+            ogrn_match = re.search(r'ОГРН\s*(\d{13})', content, re.IGNORECASE)
+        if not ogrn_match:
+            ogrn_match = re.search(
+                r'ОГРН(?:ИП)?\s*(\d{13,15})', content, re.IGNORECASE)
+
+        name_part = content
+        inn_index = content.lower().find('инн')
+        if inn_index != -1:
+            name_part = content[:inn_index]
+        name_part = name_part.strip().rstrip(' ,;')
+
+        if name_part:
+            name_lower = name_part.lower()
+            if name_lower.startswith('ип '):
+                fio = name_part[3:].strip()
+                fio_nom = self.convert_ip_fio_to_nominative(fio)
+                data['name'] = f"Индивидуальный предприниматель {fio_nom}"
+            else:
+                data['name'] = name_part
+
+        if inn_match:
+            data['inn'] = inn_match.group(1)
+        if kpp_match:
+            data['kpp'] = kpp_match.group(1)
+        if ogrn_match:
+            data['ogrn'] = ogrn_match.group(1)
+
+        index_match = None
+        for match in re.finditer(
+            r'(\d{6})(?=\s*,?\s*[А-Яа-я])', content
+        ):
+            index_match = match
+        if index_match:
+            data['address'] = content[index_match.start():].strip()
+
     def convert_to_nominative(self, text: str) -> str:
         """
         Приведение к именительному падежу (базовая реализация)
@@ -625,6 +689,8 @@ class SlidingWindowParser:
                 return 'Транспортная накладная'
         elif doc_type == 'postal_block':
             return 'Почтовое уведомление'
+        elif doc_type == 'contracts':
+            return 'Договор'
 
         return header
 
@@ -707,8 +773,17 @@ class SlidingWindowParser:
         """
         result = {}
 
+        def normalize_number(raw: str) -> str:
+            cleaned = str(raw).replace('\u00A0', '').replace('\u202F', '')
+            cleaned = re.sub(r'\s+', '', cleaned)
+            return cleaned.replace(',', '.')
+
         # Извлекаем сумму задолженности
         debt_patterns = [
+            r'итого\s+задолженность\s*[:\-]?\s*([0-9\s,]+)\s*руб',
+            r'размер\s+требований\s+составляет[^0-9]*([0-9\s,]+)\s*руб[^\n]*?задолж',
+            r'([0-9\s,]+)\s*руб[^\n]*?[—-]\s*задолж',
+            r'задолженность\s*[:\-]?\s*([0-9\s,]+)\s*руб',
             r'Стоимость услуг по договор[^0-9]*составила\s*([0-9\s,]+)\s*рубл',
             r'размер задолженности[^0-9]*составляет\s*([0-9\s,]+)\s*рубл',
             r'задолженность[^0-9]*в размере\s*([0-9\s,]+)\s*рубл',
@@ -719,8 +794,7 @@ class SlidingWindowParser:
         for pattern in debt_patterns:
             debt_match = re.search(pattern, text, re.IGNORECASE)
             if debt_match:
-                debt_str = debt_match.group(1).replace(
-                    ' ', '').replace(',', '.')
+                debt_str = normalize_number(debt_match.group(1))
                 try:
                     debt = float(debt_str)
                     break
@@ -746,14 +820,16 @@ class SlidingWindowParser:
             r'юридические услуги[^0-9]*(\d[\d\s,]*)\s*рубл[а-яё]*',
             # Паттерн для поиска в списке требований
             r'(\d[\d\s,]*)\s*рубл[а-яё]*\s*-\s*юридические услуги[^.]*',
+            r'сумма договора[^0-9]*([0-9\s,]+)\s*рубл',
+            r'договор[^\n]*юридическ[^\n]*на сумму\s*([0-9\s,]+)\s*руб',
+            r'юридическ[^\n]{0,120}?на сумму\s*([0-9\s,]+)\s*руб',
         ]
 
         legal_fees = None
         for pattern in legal_patterns:
             legal_match = re.search(pattern, text, re.IGNORECASE)
             if legal_match:
-                legal_str = legal_match.group(
-                    1).replace(' ', '').replace(',', '.')
+                legal_str = normalize_number(legal_match.group(1))
                 try:
                     legal_fees = float(legal_str)
                     break
@@ -762,6 +838,24 @@ class SlidingWindowParser:
 
         if legal_fees:
             result['legal_fees'] = f"{legal_fees:,.0f}".replace(',', ' ')
+
+        legal_contract_match = re.search(
+            r'договор[^\n]*?юридическ[^\n]*?№\s*([A-Za-zА-Яа-я0-9\-_/]+)\s*от\s*(\d{2}\.\d{2}\.\d{4})',
+            text,
+            re.IGNORECASE
+        )
+        if legal_contract_match:
+            result['legal_contract_number'] = legal_contract_match.group(1)
+            result['legal_contract_date'] = legal_contract_match.group(2)
+
+        payment_match = re.search(
+            r'плат[её]жн[а-я]*\s+поручен[иея][^\n]*№\s*(\d+)\s*от\s*(\d{2}\.\d{2}\.\d{4})',
+            text,
+            re.IGNORECASE
+        )
+        if payment_match:
+            result['legal_payment_number'] = payment_match.group(1)
+            result['legal_payment_date'] = payment_match.group(2)
 
         # Извлекаем проценты
         interest_patterns = [
@@ -774,8 +868,7 @@ class SlidingWindowParser:
         for pattern in interest_patterns:
             interest_match = re.search(pattern, text, re.IGNORECASE)
             if interest_match:
-                interest_str = interest_match.group(
-                    1).replace(' ', '').replace(',', '.')
+                interest_str = normalize_number(interest_match.group(1))
                 try:
                     total_interest = float(interest_str)
                     break
@@ -836,21 +929,56 @@ class SlidingWindowParser:
         if payment_days:
             result['payment_days'] = str(payment_days)
 
+        def extract_payment_terms_block(source: str) -> Optional[str]:
+            lines = [line.strip() for line in source.splitlines()]
+            start_idx = None
+            for i, line in enumerate(lines):
+                if re.search(r'условия\s+оплаты', line, re.IGNORECASE):
+                    start_idx = i
+                    break
+            if start_idx is None:
+                return None
+            collected = [lines[start_idx]]
+            for j in range(start_idx + 1, len(lines)):
+                line = lines[j].strip()
+                if not line:
+                    break
+                if re.match(
+                    r'^(итого задолженность|ст\.|между\s|почтов|оригиналы документов|приложения?|было произвед|произвед|платеж)',
+                    line,
+                    re.IGNORECASE
+                ):
+                    break
+                collected.append(line)
+            if not collected:
+                return None
+            if len(collected) == 1:
+                parts = re.split(r'[–\-:]', collected[0], maxsplit=1)
+                if len(parts) == 1 or not parts[1].strip():
+                    return None
+            return ' '.join(collected)
+
         # Извлекаем полный текст о порядке оплаты
         payment_terms_patterns = [
+            r'(Условия\s+оплаты[^\n]*[–\-:]\s*[^\n]+)',
+            r'(оплаты\s+по\s+договор[^\n]*[–\-:]\s*[^\n]+)',
             r'(Согласно[^\n]*оплата[^\n]*производится[^\n]*)',
             r'(оплата[^\n]*производится[^\n]*)',
-            r'(срок[^\n]*оплаты[^\n]*)',
             r'(оплата[^\n]*безналичным[^\n]*расчетом[^\n]*)',
+            r'(срок[^\n]*оплаты[^\n]*[–\-:]\s*[^\n]+)',
         ]
 
         payment_terms = None
-        for pattern in payment_terms_patterns:
-            payment_terms_match = re.search(pattern, text, re.IGNORECASE)
-            if payment_terms_match:
-                payment_terms = payment_terms_match.group(1).strip()
-                payment_terms = re.sub(r'\s+', ' ', payment_terms)
-                break
+        payment_terms_block = extract_payment_terms_block(text)
+        if payment_terms_block:
+            payment_terms = payment_terms_block
+        if not payment_terms:
+            for pattern in payment_terms_patterns:
+                payment_terms_match = re.search(pattern, text, re.IGNORECASE)
+                if payment_terms_match:
+                    payment_terms = payment_terms_match.group(1).strip()
+                    payment_terms = re.sub(r'\s+', ' ', payment_terms)
+                    break
 
         if payment_terms:
             result['payment_terms'] = payment_terms
@@ -876,6 +1004,56 @@ class SlidingWindowParser:
         due_date_match = re.search(due_date_pattern, text, re.IGNORECASE)
         if due_date_match:
             result['payment_due_date'] = due_date_match.group(1)
+
+        postal_numbers = []
+        postal_dates = []
+        received_numbers = []
+        received_dates = []
+        found_received_line = False
+        for line in text.splitlines():
+            line_clean = line.strip()
+            if not line_clean:
+                continue
+            line_lower = line_clean.lower()
+            if (
+                re.search(r'получен[а-я]*', line_lower)
+                and any(token in line_lower for token in ['трек', 'почтов', 'отправ'])
+            ):
+                found_received_line = True
+                received_numbers.extend(
+                    re.findall(r'\b\d{10,20}\b', line_clean)
+                )
+                received_dates.extend(
+                    re.findall(r'\d{2}\.\d{2}\.\d{4}', line_clean)
+                )
+                continue
+            if (
+                'трек' in line_lower
+                or ('почтов' in line_lower and '№' in line_clean)
+            ):
+                postal_numbers.extend(
+                    re.findall(r'\b\d{10,20}\b', line_clean)
+                )
+        if not postal_numbers:
+            postal_numbers = re.findall(
+                r'трек\s*номер[а-я]*\s*№?\s*(\d{10,20})',
+                text,
+                re.IGNORECASE
+            )
+        if not postal_dates and not found_received_line:
+            postal_dates = re.findall(
+                r'получен[а-я]*\s*(\d{2}\.\d{2}\.\d{4})',
+                text,
+                re.IGNORECASE
+            )
+        if received_numbers:
+            result['postal_numbers'] = received_numbers
+        elif postal_numbers:
+            result['postal_numbers'] = postal_numbers
+        if received_dates:
+            result['postal_dates'] = received_dates
+        elif postal_dates:
+            result['postal_dates'] = postal_dates
 
         return result
 
@@ -1030,6 +1208,91 @@ class SlidingWindowParser:
             return '; '.join(sorted(unique_invoices))
         return 'Не указано'
 
+    def extract_cargo_docs(self, text: str) -> str:
+        """
+        Извлекает накладные и комплект сопроводительных документов.
+        """
+        patterns = [
+            (
+                r'товарно[-\s]*транспортн[а-яё]*\s+накладн[а-яё]*[^\n;\.]*'
+                r'№\s*(\d+)[^\n;\.]*от\s*(\d{2}\.\d{2}\.\d{4})',
+                'Товарно-транспортная накладная',
+            ),
+            (
+                r'транспортн[а-яё]*\s+накладн[а-яё]*[^\n;\.]*'
+                r'№\s*(\d+)[^\n;\.]*от\s*(\d{2}\.\d{2}\.\d{4})',
+                'Транспортная накладная',
+            ),
+            (
+                r'товарн[а-яё]*\s+накладн[а-яё]*[^\n;\.]*'
+                r'№\s*(\d+)[^\n;\.]*от\s*(\d{2}\.\d{2}\.\d{4})',
+                'Товарная накладная',
+            ),
+        ]
+
+        unique_docs = set()
+        seen_pairs = set()
+
+        for pattern, label in patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            for num, date in matches:
+                key = (num, date)
+                if key in seen_pairs:
+                    continue
+                seen_pairs.add(key)
+                unique_docs.add(f"{label} №{num} от {date} г.")
+
+        if re.search(
+            r'комплект[а-яё]*\s+сопроводительных\s+документов',
+            text,
+            re.IGNORECASE,
+        ):
+            unique_docs.add('Комплект сопроводительных документов')
+
+        if unique_docs:
+            return '; '.join(sorted(unique_docs))
+        return 'Не указано'
+
+    def extract_contracts(self, text: str) -> str:
+        """
+        Извлекает договоры с ограничением на строки/пункты, чтобы не захватывать другие документы.
+        """
+        pattern = re.compile(
+            r'договор(?![\w-]*заявк)[^\n;]*?№\s*'
+            r'([A-Za-zА-Яа-я0-9\-_/]+)[^\n;]*?от\s*'
+            r'(\d{2}\.\d{2}\.\d{4})',
+            re.IGNORECASE,
+        )
+
+        unique_contracts = set()
+        for match in pattern.finditer(text):
+            matched_text = match.group(0).lower()
+            if 'юридическ' in matched_text:
+                continue
+            if any(
+                marker in matched_text
+                for marker in (
+                    'поручен',
+                    'платеж',
+                    'счет',
+                    'акт',
+                    'накладн',
+                    'заявк',
+                    'упд',
+                    'квитанц',
+                    'уведомлен',
+                    'отчет',
+                )
+            ):
+                continue
+            number = match.group(1)
+            date = match.group(2)
+            unique_contracts.add(f"Договор №{number} от {date} г.")
+
+        if unique_contracts:
+            return '; '.join(sorted(unique_contracts))
+        return 'Не указано'
+
 
 def parse_documents_with_sliding_window(text: str, debug: bool = False) -> Dict[str, str]:
     """
@@ -1066,9 +1329,13 @@ def parse_documents_with_sliding_window(text: str, debug: bool = False) -> Dict[
     contract_applications = parser.extract_contract_applications(text)
     upd_blocks = parser.extract_upd_blocks(text)
     invoice_blocks = parser.extract_invoice_blocks(text)
+    cargo_docs = parser.extract_cargo_docs(text)
+    contracts = parser.extract_contracts(text)
     result['contract_applications'] = contract_applications
     result['upd_blocks'] = upd_blocks
     result['invoice_blocks'] = invoice_blocks
+    result['cargo_docs'] = cargo_docs
+    result['contracts'] = contracts
 
     # Добавляем подписанта и приложения
     signatory = parser.extract_signatory(text)
