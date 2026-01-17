@@ -9,8 +9,10 @@ import re
 import shutil
 import uuid
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
+from xml.etree import ElementTree as ET
 
+import requests
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
@@ -184,6 +186,190 @@ def generate_claim_paragraph(user_data: dict) -> str:
             "Не указано г. Истцом в адрес Ответчика была направлена "
             "досудебная претензия."
         )
+
+
+class RussianPostTrackingError(Exception):
+    pass
+
+
+def get_russian_post_config() -> Dict[str, object]:
+    login = os.getenv("RUSSIAN_POST_LOGIN", "").strip()
+    password = os.getenv("RUSSIAN_POST_PASSWORD", "").strip()
+    return {
+        "enabled": bool(login and password),
+        "login": login,
+        "password": password,
+        "endpoint": os.getenv(
+            "RUSSIAN_POST_ENDPOINT",
+            "https://tracking.russianpost.ru/rtm34"
+        ).strip(),
+        "language": os.getenv("RUSSIAN_POST_LANGUAGE", "RUS").strip() or "RUS",
+        "message_type": os.getenv("RUSSIAN_POST_MESSAGE_TYPE", "0").strip() or "0",
+        "timeout": int(os.getenv("RUSSIAN_POST_TIMEOUT", "30") or "30"),
+    }
+
+
+def normalize_tracking_number(value: str) -> str:
+    return re.sub(r'[^0-9A-Za-z]', '', value or '').upper()
+
+
+def is_valid_tracking_number(value: str) -> bool:
+    if not value:
+        return False
+    if re.fullmatch(r'\d{10,20}', value):
+        return True
+    return bool(re.fullmatch(r'[A-Z]{2}\d{9}[A-Z]{2}', value))
+
+
+def build_russian_post_request(barcode: str, config: Dict[str, object]) -> str:
+    language = config.get("language", "RUS")
+    message_type = config.get("message_type", "0")
+    login = config.get("login", "")
+    password = config.get("password", "")
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" '
+        'xmlns:oper="http://russianpost.org/operationhistory" '
+        'xmlns:data="http://russianpost.org/operationhistory/data" '
+        'xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">'
+        '<soap:Header/>'
+        '<soap:Body>'
+        '<oper:getOperationHistory>'
+        '<data:OperationHistoryRequest>'
+        f'<data:Barcode>{barcode}</data:Barcode>'
+        f'<data:MessageType>{message_type}</data:MessageType>'
+        f'<data:Language>{language}</data:Language>'
+        '</data:OperationHistoryRequest>'
+        '<data:AuthorizationHeader soapenv:mustUnderstand="1">'
+        f'<data:login>{login}</data:login>'
+        f'<data:password>{password}</data:password>'
+        '</data:AuthorizationHeader>'
+        '</oper:getOperationHistory>'
+        '</soap:Body>'
+        '</soap:Envelope>'
+    )
+
+
+def parse_russian_post_date(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    cleaned = value.strip()
+    try:
+        return datetime.fromisoformat(cleaned.replace('Z', '+00:00'))
+    except ValueError:
+        match = re.search(
+            r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}',
+            cleaned
+        )
+        if match:
+            try:
+                return datetime.strptime(
+                    match.group(0),
+                    "%Y-%m-%dT%H:%M:%S"
+                )
+            except ValueError:
+                return None
+    return None
+
+
+def extract_fault_message(root: ET.Element) -> Optional[str]:
+    for fault_name in ("AuthorizationFault", "OperationHistoryFault", "LanguageFault"):
+        fault_elem = root.find(f".//{{*}}{fault_name}")
+        if fault_elem is not None:
+            for tag in ("Description", "Message", "FaultString"):
+                text = fault_elem.findtext(f".//{{*}}{tag}")
+                if text:
+                    return text.strip()
+            return fault_name
+    fault_elem = root.find(".//{*}Fault")
+    if fault_elem is not None:
+        text = fault_elem.findtext(".//{*}Text") or fault_elem.findtext(".//{*}faultstring")
+        if text:
+            return text.strip()
+        return "Ошибка сервиса отслеживания"
+    return None
+
+
+def fetch_russian_post_operations(barcode: str) -> List[Dict[str, object]]:
+    config = get_russian_post_config()
+    if not config.get("enabled"):
+        raise RussianPostTrackingError("Не настроен доступ к API Почты России.")
+
+    payload = build_russian_post_request(barcode, config)
+    try:
+        response = requests.post(
+            config.get("endpoint"),
+            data=payload.encode("utf-8"),
+            headers={"Content-Type": "application/soap+xml; charset=utf-8"},
+            timeout=config.get("timeout", 30),
+        )
+    except requests.RequestException as exc:
+        raise RussianPostTrackingError(
+            "Сервис отслеживания недоступен. Попробуйте позже."
+        ) from exc
+
+    if response.status_code != 200:
+        raise RussianPostTrackingError(
+            f"Сервис отслеживания вернул код {response.status_code}."
+        )
+
+    try:
+        root = ET.fromstring(response.text)
+    except ET.ParseError as exc:
+        raise RussianPostTrackingError(
+            "Не удалось разобрать ответ сервиса отслеживания."
+        ) from exc
+
+    fault_message = extract_fault_message(root)
+    if fault_message:
+        raise RussianPostTrackingError(fault_message)
+
+    records = []
+    for record in root.findall(".//{*}historyRecord"):
+        oper_date_raw = record.findtext(".//{*}OperDate")
+        oper_date = parse_russian_post_date(oper_date_raw)
+        if not oper_date:
+            continue
+        oper_type = record.findtext(".//{*}OperType/{*}Name") or ""
+        oper_attr = record.findtext(".//{*}OperAttr/{*}Name") or ""
+        records.append({
+            "date": oper_date,
+            "oper_type": oper_type.strip(),
+            "oper_attr": oper_attr.strip(),
+        })
+
+    return sorted(records, key=lambda item: item["date"])
+
+
+def extract_tracking_dates(records: List[Dict[str, object]]) -> Tuple[Optional[str], Optional[str]]:
+    if not records:
+        return None, None
+
+    def normalize(text: str) -> str:
+        return (text or "").lower().replace("ё", "е")
+
+    send_date = None
+    for record in records:
+        if "прием" in normalize(str(record.get("oper_type", ""))):
+            send_date = record["date"]
+            break
+
+    if not send_date:
+        send_date = records[0]["date"]
+
+    receive_date = None
+    for record in records:
+        combined = normalize(
+            f"{record.get('oper_type', '')} {record.get('oper_attr', '')}"
+        )
+        if "неудач" in combined or "отправител" in combined:
+            continue
+        if "вруч" in combined or "получен" in combined:
+            receive_date = record["date"]
+
+    send_str = send_date.strftime("%d.%m.%Y") if send_date else None
+    receive_str = receive_date.strftime("%d.%m.%Y") if receive_date else None
+    return send_str, receive_str
 
 
 def format_header_paragraph(paragraph, label, value, postfix=None):
@@ -778,6 +964,114 @@ def fix_number_spacing(text: str) -> str:
     return re.sub(r'№(\d)', r'№ \1', text)
 
 
+ATTACHMENTS_EXTRA_TOP = [
+    "Претензия – копия",
+    "Чек и опись об отправке требования – копия",
+]
+ATTACHMENTS_EXTRA_TAIL = [
+    "Квитанция об уплате государственной пошлины",
+    "Документы, подтверждающие отправку искового заявления Ответчику - копия",
+    "Доверенность на представителя – копия",
+]
+F107_EXCLUDED_ATTACHMENTS = [
+    "Квитанция об уплате государственной пошлины",
+    "Документы, подтверждающие отправку искового заявления Ответчику - копия",
+    "Доверенность на представителя – копия",
+]
+F107_MAX_ITEMS = 14
+
+
+def normalize_attachment_text(value: str) -> str:
+    cleaned = str(value).lower().replace('ё', 'е')
+    cleaned = re.sub(r'[\s\.,;:–—-]+', ' ', cleaned)
+    return cleaned.strip()
+
+
+def build_isk_attachments_list(attachments) -> List[str]:
+    if isinstance(attachments, str):
+        attachments = [attachments]
+    attachments = attachments or []
+
+    base_attachments = []
+    for att in attachments:
+        if not att or str(att).strip() == "Не указано":
+            continue
+        att_clean = fix_number_spacing(normalize_document_item(att))
+        if att_clean:
+            base_attachments.append(att_clean)
+
+    final_attachments = []
+    seen = set()
+
+    def add_unique(item: str) -> None:
+        key = normalize_attachment_text(item)
+        if not key or key in seen:
+            return
+        seen.add(key)
+        final_attachments.append(item)
+
+    for item in ATTACHMENTS_EXTRA_TOP:
+        add_unique(item)
+    for item in base_attachments:
+        add_unique(item)
+    for item in ATTACHMENTS_EXTRA_TAIL:
+        add_unique(item)
+
+    return final_attachments
+
+
+def resolve_defendant_display_name(
+    name_short: Optional[str],
+    name_full: Optional[str]
+) -> str:
+    for value in (name_short, name_full):
+        if value and str(value).strip() and str(value).strip() != 'Не указано':
+            return str(value).strip()
+    return "Ответчик"
+
+
+def build_f107_items(
+    attachments,
+    defendant_name: str
+) -> List[str]:
+    items = build_isk_attachments_list(attachments)
+    excluded = {
+        normalize_attachment_text(item)
+        for item in F107_EXCLUDED_ATTACHMENTS
+    }
+    filtered_items = [
+        item for item in items
+        if normalize_attachment_text(item) not in excluded
+    ]
+
+    final_items = []
+    seen = set()
+
+    def add_unique(item: str) -> None:
+        normalized = normalize_attachment_text(item)
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        final_items.append(item)
+
+    claim_item = normalize_document_item(
+        f"Исковое заявление к {defendant_name}"
+    )
+    add_unique(claim_item)
+    for item in filtered_items:
+        add_unique(item)
+
+    if len(final_items) > F107_MAX_ITEMS:
+        logging.warning(
+            "Слишком много приложений для Ф107: %s, используется %s",
+            len(final_items),
+            F107_MAX_ITEMS
+        )
+        final_items = final_items[:F107_MAX_ITEMS]
+
+    return final_items
+
+
 def replace_attachments_with_paragraphs(doc, attachments):
     """
     Заменяет плейсхолдер {attachments} списком приложений с нумерацией и добавляет заголовок 'Приложения:'.
@@ -835,45 +1129,7 @@ def replace_attachments_with_paragraphs(doc, attachments):
                 p = paragraph._element
                 parent.remove(p)
 
-        def normalize_attachment_text(value: str) -> str:
-            cleaned = value.lower().replace('ё', 'е')
-            cleaned = re.sub(r'[\s\.,;:–—-]+', ' ', cleaned)
-            return cleaned.strip()
-
-        base_attachments = []
-        for att in attachments:
-            if not att or str(att).strip() == "Не указано":
-                continue
-            att_clean = fix_number_spacing(str(att).rstrip(';').strip())
-            if att_clean:
-                base_attachments.append(att_clean)
-
-        extra_top = [
-            "Претензия – копия",
-            "Чек и опись об отправке требования – копия",
-        ]
-        extra_tail = [
-            "Квитанция об уплате государственной пошлины",
-            "Документы, подтверждающие отправку искового заявления Ответчику - копия",
-            "Доверенность на представителя – копия",
-        ]
-
-        final_attachments = []
-        seen = set()
-
-        def add_unique(item: str) -> None:
-            key = normalize_attachment_text(item)
-            if not key or key in seen:
-                return
-            seen.add(key)
-            final_attachments.append(item)
-
-        for item in extra_top:
-            add_unique(item)
-        for item in base_attachments:
-            add_unique(item)
-        for item in extra_tail:
-            add_unique(item)
+        final_attachments = build_isk_attachments_list(attachments)
 
         # Динамические приложения с нумерацией
         attachment_number = 1
@@ -933,6 +1189,125 @@ def replace_documents_list_with_paragraphs(
         idx += 1
 
     return True
+
+
+def iter_table_paragraphs(table):
+    for row in table.rows:
+        for cell in row.cells:
+            for paragraph in cell.paragraphs:
+                yield paragraph
+            for nested in cell.tables:
+                yield from iter_table_paragraphs(nested)
+
+
+def iter_document_paragraphs(doc):
+    for paragraph in doc.paragraphs:
+        yield paragraph
+    for table in doc.tables:
+        yield from iter_table_paragraphs(table)
+
+
+def replace_placeholders_simple(doc, replacements: Dict[str, str]) -> None:
+    for paragraph in iter_document_paragraphs(doc):
+        if not paragraph.runs:
+            continue
+        full_text = ''.join(run.text for run in paragraph.runs)
+        if not full_text:
+            continue
+        updated = full_text
+        for key, value in replacements.items():
+            if key in updated:
+                updated = updated.replace(key, value)
+        if updated != full_text:
+            paragraph.runs[0].text = updated
+            for run in paragraph.runs[1:]:
+                run.text = ''
+
+
+def create_f107_document(
+    items: List[str],
+    sender_name: str,
+    sender_company: str,
+    output_path: Optional[str] = None
+) -> str:
+    template_dir = os.path.dirname(__file__)
+    candidate_templates = [
+        os.path.join(template_dir, 'templates', 'F107.docx'),
+        os.path.join(template_dir, 'F107.docx'),
+    ]
+    template_path = next(
+        (path for path in candidate_templates if os.path.exists(path)),
+        None
+    )
+    if template_path is None:
+        raise FileNotFoundError("Шаблон Ф107 не найден.")
+
+    doc = Document(template_path)
+    replacements: Dict[str, str] = {}
+    total_quantity = 0
+    total_value = 0
+
+    for index in range(F107_MAX_ITEMS):
+        suffix = '' if index == 0 else str(index)
+        if index < len(items):
+            item_text = normalize_document_item(items[index])
+            replacements[f"${{predmet{suffix}}}"] = item_text
+            replacements[f"${{kolich_predm{suffix}}}"] = "1"
+            replacements[f"${{sum_predm{suffix}}}"] = "0"
+            total_quantity += 1
+        else:
+            replacements[f"${{predmet{suffix}}}"] = ""
+            replacements[f"${{kolich_predm{suffix}}}"] = ""
+            replacements[f"${{sum_predm{suffix}}}"] = ""
+
+    replacements["${sum_predmetov}"] = str(total_quantity) if total_quantity else ""
+    replacements["${sum_kolich}"] = str(total_value) if total_quantity else ""
+    replacements["${namef107}"] = ""
+    replacements["${company}"] = sender_company or ""
+
+    replace_placeholders_simple(doc, replacements)
+
+    if output_path is None:
+        output_name = f"Опись_вложения_F107_{uuid.uuid4().hex}.docx"
+        output_path = os.path.join(os.path.dirname(__file__), output_name)
+    doc.save(output_path)
+    return output_path
+
+
+def format_poa_date(value: Optional[datetime] = None) -> str:
+    target = value or datetime.today()
+    months = [
+        'января', 'февраля', 'марта', 'апреля', 'мая', 'июня',
+        'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'
+    ]
+    month_name = months[target.month - 1]
+    return f"«{target:%d}» {month_name} {target.year} г."
+
+
+def create_power_of_attorney_document(
+    replacements: Dict[str, str],
+    output_path: Optional[str] = None
+) -> str:
+    template_dir = os.path.dirname(__file__)
+    candidate_templates = [
+        os.path.join(template_dir, 'templates', 'ДОВЕРЕННОСТЬ.docx'),
+        os.path.join(template_dir, 'ДОВЕРЕННОСТЬ.docx'),
+    ]
+    template_path = next(
+        (path for path in candidate_templates if os.path.exists(path)),
+        None
+    )
+    if template_path is None:
+        raise FileNotFoundError("Шаблон доверенности не найден.")
+
+    doc = Document(template_path)
+    replace_placeholders_simple(doc, replacements)
+
+    if output_path is None:
+        output_name = f"Доверенность_{uuid.uuid4().hex}.docx"
+        output_path = os.path.join(os.path.dirname(__file__), output_name)
+    doc.save(output_path)
+    return output_path
 
 
 def number_attachments_section(doc):
@@ -1082,15 +1457,30 @@ def create_isk_document(
     output_path: Optional[str] = None
 ) -> str:
     template_dir = os.path.dirname(__file__)
-    primary_template = os.path.join(template_dir, 'template_isk.docx')
-    fallback_template = os.path.join(template_dir, 'template.docx')
-    if os.path.exists(primary_template):
-        template_path = primary_template
-    else:
+    candidate_templates = [
+        os.path.join(template_dir, 'templates', 'template_isk.docx'),
+        os.path.join(template_dir, 'template_isk.docx'),
+    ]
+    fallback_templates = [
+        os.path.join(template_dir, 'templates', 'template.docx'),
+        os.path.join(template_dir, 'template.docx'),
+    ]
+    template_path = next(
+        (path for path in candidate_templates if os.path.exists(path)),
+        None
+    )
+    if template_path is None:
+        template_path = next(
+            (path for path in fallback_templates if os.path.exists(path)),
+            None
+        )
         logging.warning(
             "Шаблон template_isk.docx не найден, используется template.docx"
         )
-        template_path = fallback_template
+    if template_path is None:
+        raise FileNotFoundError(
+            "Шаблон искового заявления не найден."
+        )
     doc = Document(template_path)
     replacements = replacements.copy()
     if documents_list_structured:
@@ -1184,7 +1574,54 @@ async def ask_send_date(update, context):
 
 
 async def ask_track(update, context):
-    context.user_data['claim_number'] = update.message.text.strip()
+    raw_track = update.message.text.strip()
+    track_number = normalize_tracking_number(raw_track)
+
+    if context.user_data.get('use_tracking_api'):
+        if not is_valid_tracking_number(track_number):
+            await update.message.reply_text(
+                "Трек-номер некорректен. Введите номер из 10-20 цифр "
+                "или формат S10 (например RA123456789RU)."
+            )
+            return ASK_TRACK
+        try:
+            records = fetch_russian_post_operations(track_number)
+        except RussianPostTrackingError as exc:
+            await update.message.reply_text(
+                f"Не удалось получить данные по трек-номеру. {exc} "
+                "Проверьте номер и попробуйте снова."
+            )
+            return ASK_TRACK
+
+        send_date, receive_date = extract_tracking_dates(records)
+        if not send_date:
+            await update.message.reply_text(
+                "Не удалось определить дату отправления по треку. "
+                "Проверьте номер и попробуйте снова."
+            )
+            return ASK_TRACK
+
+        context.user_data['claim_number'] = track_number
+        context.user_data['claim_date'] = send_date
+        context.user_data['postal_receive_date'] = receive_date or ''
+        context.user_data['claim_status'] = (
+            'claim_received' if receive_date else 'claim_not_received'
+        )
+
+        if receive_date:
+            await update.message.reply_text(
+                f"Найдены даты: отправление {send_date}, получение {receive_date}."
+            )
+        else:
+            await update.message.reply_text(
+                f"Найдена дата отправления {send_date}. "
+                "Вручение адресату не найдено."
+            )
+
+        await finish_claim(update, context)
+        return ConversationHandler.END
+
+    context.user_data['claim_number'] = raw_track
     if context.user_data.get('claim_status') == 'claim_received':
         await update.message.reply_text("Введите дату получения (ДД.ММ.ГГГГ):")
         return ASK_RECEIVE_DATE
@@ -1399,16 +1836,88 @@ async def finish_claim(update, context):
         replacements,
         documents_list_structured=documents_list_structured
     )
+    f107_path = None
+    poa_path = None
+    try:
+        defendant_display_name = resolve_defendant_display_name(
+            defendant_name_short,
+            defendant_name
+        )
+        f107_items = build_f107_items(
+            claim_data.get('attachments', []),
+            defendant_display_name
+        )
+        sender_name = normalize_str(
+            claim_data.get('signatory'),
+            default=''
+        )
+        if sender_name == 'Не указано':
+            sender_name = ''
+        if not sender_name:
+            sender_name = (
+                plaintiff_name_short
+                if plaintiff_name_short != 'Не указано'
+                else ''
+            )
+        sender_company = (
+            plaintiff_name
+            if plaintiff_name != 'Не указано'
+            else plaintiff_name_short
+        )
+        f107_path = create_f107_document(
+            f107_items,
+            sender_name,
+            sender_company
+        )
+    except FileNotFoundError as exc:
+        logging.warning("Не удалось сформировать Ф107: %s", exc)
+    except Exception as exc:
+        logging.error("Ошибка формирования Ф107: %s", exc, exc_info=True)
+    try:
+        poa_replacements = {
+            '{poa_date}': format_poa_date(),
+            '{plaintiff_name}': normalize_str(plaintiff_name),
+            '{plaintiff_inn}': normalize_str(claim_data.get('plaintiff_inn')),
+            '{plaintiff_ogrn}': normalize_str(claim_data.get('plaintiff_ogrn')),
+            '{plaintiff_address}': normalize_str(
+                claim_data.get('plaintiff_address')
+            ).replace('\n', ' ').strip(),
+        }
+        poa_path = create_power_of_attorney_document(poa_replacements)
+    except FileNotFoundError as exc:
+        logging.warning("Не удалось сформировать доверенность: %s", exc)
+    except Exception as exc:
+        logging.error(
+            "Ошибка формирования доверенности: %s",
+            exc,
+            exc_info=True
+        )
     with open(result_docx, 'rb') as f:
         await update.message.reply_document(
             InputFile(f, filename="Исковое_заявление.docx"),
             caption="Исковое заявление по ст. 395 ГК РФ"
         )
+    if f107_path:
+        with open(f107_path, 'rb') as f:
+            await update.message.reply_document(
+                InputFile(f, filename="Опись_вложения_F107.docx"),
+                caption="Опись вложения (форма Ф107)"
+            )
+    if poa_path:
+        with open(poa_path, 'rb') as f:
+            await update.message.reply_document(
+                InputFile(f, filename="Доверенность.docx"),
+                caption="Доверенность на представителя"
+            )
     try:
         if os.path.exists(file_path):
             os.remove(file_path)
         if os.path.exists(result_docx):
             os.remove(result_docx)
+        if f107_path and os.path.exists(f107_path):
+            os.remove(f107_path)
+        if poa_path and os.path.exists(poa_path):
+            os.remove(poa_path)
     except Exception as e:
         logging.warning(
             f"Не удалось удалить файл {file_path}: {e}"
@@ -1571,6 +2080,22 @@ async def ask_claim_status_after_jurisdiction(update_or_query, context):
     """
     Переход к вопросам о претензии после определения подсудности.
     """
+    config = get_russian_post_config()
+    if config.get("enabled"):
+        context.user_data['use_tracking_api'] = True
+        if hasattr(update_or_query, 'message') and update_or_query.message:
+            await update_or_query.message.reply_text(
+                "Введите трек-номер отправления претензии. "
+                "Я сам определю дату отправки и получения."
+            )
+        else:
+            await update_or_query.message.reply_text(
+                "Введите трек-номер отправления претензии. "
+                "Я сам определю дату отправки и получения."
+            )
+        return ASK_TRACK
+
+    context.user_data['use_tracking_api'] = False
     keyboard = [
         [
             InlineKeyboardButton("✅ Да", callback_data='claim_received'),
