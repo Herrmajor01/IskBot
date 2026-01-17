@@ -6,3 +6,5 @@ urllib3<2.0
 python-dotenv
 pymorphy2
 flake8
+pypdf
+pymupdf

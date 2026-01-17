@@ -3,13 +3,14 @@
 автоматизации расчёта процентов по ст. 395 ГК РФ.
 """
 
+import json
 import logging
 import os
 import re
 import shutil
 import uuid
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 from xml.etree import ElementTree as ET
 
 import requests
@@ -25,8 +26,9 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           filters)
 
 from cal import calculate_duty
-from calc_395 import calculate_full_395, get_key_rates_from_395gk
-from llm_fallback import apply_llm_fallback
+from calc_395 import (calc_395_on_periods, calculate_full_395,
+                      get_key_rates_from_395gk, split_period_by_key_rate)
+from llm_fallback import apply_llm_fallback, extract_document_groups_llm
 from sliding_window_parser import parse_documents_with_sliding_window
 
 load_dotenv()
@@ -40,8 +42,56 @@ logging.basicConfig(
 logging.info("Bot script started")
 
 # Состояния диалога
-(ASK_JURISDICTION, ASK_CUSTOM_COURT, ASK_CLAIM_STATUS,
- ASK_TRACK, ASK_RECEIVE_DATE, ASK_SEND_DATE) = range(6)
+(
+    ASK_FLOW,
+    ASK_DOCUMENT,
+    ASK_JURISDICTION,
+    ASK_CUSTOM_COURT,
+    ASK_CLAIM_STATUS,
+    ASK_TRACK,
+    ASK_RECEIVE_DATE,
+    ASK_SEND_DATE,
+    ASK_PRETENSION_FIELD,
+) = range(9)
+
+PRETENSION_FIELD_ORDER = [
+    "plaintiff_name",
+    "defendant_name",
+    "debt",
+    "payment_days",
+    "docs_received_date",
+    "docs_track_number",
+]
+
+PRETENSION_FIELD_DEFS = {
+    "plaintiff_name": {
+        "prompt": "Укажите отправителя претензии (истца):",
+        "required": True,
+    },
+    "defendant_name": {
+        "prompt": "Укажите получателя претензии (должника):",
+        "required": True,
+    },
+    "debt": {
+        "prompt": "Укажите сумму задолженности (в рублях):",
+        "required": True,
+    },
+    "payment_days": {
+        "prompt": "Укажите срок оплаты в рабочих днях (только число):",
+        "required": True,
+    },
+    "docs_received_date": {
+        "prompt": "Укажите дату получения оригиналов документов (ДД.ММ.ГГГГ):",
+        "required": True,
+    },
+    "docs_track_number": {
+        "prompt": (
+            "Укажите трек-номер отправки оригиналов документов "
+            "(или напишите «пропустить»):"
+        ),
+        "required": False,
+    },
+}
 
 
 def get_court_by_address(defendant_address: str) -> Tuple[str, str]:
@@ -727,6 +777,547 @@ def generate_payment_terms(claim_data: dict) -> str:
     )
 
 
+def parse_date_str(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    match = re.search(r'\d{2}\.\d{2}\.\d{4}', str(value))
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(0), "%d.%m.%Y")
+    except ValueError:
+        return None
+
+
+def format_money(amount: float, decimals: int = 2) -> str:
+    if decimals <= 0:
+        return f"{amount:,.0f}".replace(',', ' ')
+    return f"{amount:,.{decimals}f}".replace(',', ' ')
+
+
+def format_russian_date(value: Optional[datetime] = None) -> str:
+    target = value or datetime.today()
+    months = [
+        'января', 'февраля', 'марта', 'апреля', 'мая', 'июня',
+        'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'
+    ]
+    month_name = months[target.month - 1]
+    return f"«{target:%d}» {month_name} {target.year} г."
+
+
+WORK_CALENDAR_CACHE = os.path.join(
+    os.path.dirname(__file__),
+    "work_calendar_cache.json"
+)
+
+
+def _parse_ru_month(value: str) -> Optional[int]:
+    mapping = {
+        "января": 1,
+        "февраля": 2,
+        "марта": 3,
+        "апреля": 4,
+        "мая": 5,
+        "июня": 6,
+        "июля": 7,
+        "августа": 8,
+        "сентября": 9,
+        "октября": 10,
+        "ноября": 11,
+        "декабря": 12,
+    }
+    return mapping.get(value.lower())
+
+
+def fetch_work_calendar(year: int) -> Dict[datetime.date, bool]:
+    url = (
+        f"https://calendar.yoip.ru/work/{year}-proizvodstvennyj-calendar.html"
+    )
+    response = requests.get(url, timeout=15)
+    response.raise_for_status()
+    html = response.text
+
+    pattern = re.compile(
+        r'title="[^"]*(\d{1,2})&nbsp;([А-Яа-яЁё]+)\s+'
+        r'(\d{4})&nbsp;года\.\s*Это\s+'
+        r'(выходной|рабочий)\s+день',
+        re.IGNORECASE
+    )
+    calendar: Dict[datetime.date, bool] = {}
+    for match in pattern.finditer(html):
+        day_raw, month_raw, year_raw, kind = match.groups()
+        month = _parse_ru_month(month_raw)
+        if not month:
+            continue
+        try:
+            date_obj = datetime(
+                int(year_raw),
+                month,
+                int(day_raw)
+            ).date()
+        except ValueError:
+            continue
+        is_working = "рабоч" in kind.lower()
+        calendar[date_obj] = is_working
+    return calendar
+
+
+def load_work_calendar(year: int) -> Dict[datetime.date, bool]:
+    try:
+        if os.path.exists(WORK_CALENDAR_CACHE):
+            with open(WORK_CALENDAR_CACHE, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if isinstance(payload, dict) and str(year) in payload:
+                cached = payload[str(year)]
+                if isinstance(cached, dict):
+                    result = {}
+                    for key, value in cached.items():
+                        try:
+                            date_obj = datetime.strptime(
+                                key, "%Y-%m-%d"
+                            ).date()
+                        except ValueError:
+                            continue
+                        result[date_obj] = bool(value)
+                    if result:
+                        return result
+    except Exception as exc:
+        logging.warning("Ошибка чтения календаря рабочих дней: %s", exc)
+
+    try:
+        calendar = fetch_work_calendar(year)
+    except Exception as exc:
+        logging.warning(
+            "Не удалось загрузить производственный календарь: %s",
+            exc
+        )
+        return {}
+
+    try:
+        payload = {}
+        if os.path.exists(WORK_CALENDAR_CACHE):
+            with open(WORK_CALENDAR_CACHE, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        payload[str(year)] = {
+            date_obj.strftime("%Y-%m-%d"): int(is_working)
+            for date_obj, is_working in calendar.items()
+        }
+        with open(WORK_CALENDAR_CACHE, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        logging.warning(
+            "Ошибка сохранения календаря рабочих дней: %s",
+            exc
+        )
+
+    return calendar
+
+
+def is_working_day(value: datetime, calendar: Dict[datetime.date, bool]) -> bool:
+    if calendar:
+        lookup = calendar.get(value.date())
+        if lookup is not None:
+            return lookup
+    return value.weekday() < 5
+
+
+def add_working_days(
+    start_date: datetime,
+    days: int,
+    calendar: Dict[datetime.date, bool]
+) -> datetime:
+    if days <= 0:
+        return start_date
+    current = start_date
+    added = 0
+    while added < days:
+        current += timedelta(days=1)
+        if is_working_day(current, calendar):
+            added += 1
+    return current
+
+
+def extract_pdf_text(file_path: str) -> Tuple[str, List[int]]:
+    try:
+        from pypdf import PdfReader
+    except Exception as exc:
+        raise RuntimeError(
+            f"Не удалось импортировать pypdf для чтения PDF: {exc}"
+        ) from exc
+
+    reader = PdfReader(file_path)
+    texts = []
+    low_text_pages: List[int] = []
+    min_chars = 40
+
+    for idx, page in enumerate(reader.pages, start=1):
+        page_text = page.extract_text() or ""
+        cleaned = page_text.strip()
+        if len(cleaned) < min_chars:
+            low_text_pages.append(idx)
+        texts.append(f"[Страница {idx}]\n{cleaned}")
+
+    return "\n\n".join(texts).strip(), low_text_pages
+
+
+def render_pdf_pages(
+    file_path: str,
+    pages: List[int],
+    max_pages: int = 3
+) -> List[str]:
+    try:
+        import fitz  # PyMuPDF
+    except Exception:
+        return []
+
+    doc = fitz.open(file_path)
+    image_paths = []
+    for page_number in pages[:max_pages]:
+        try:
+            page = doc.load_page(page_number - 1)
+        except Exception:
+            continue
+        pix = page.get_pixmap(dpi=150)
+        output_name = f"scan_{uuid.uuid4().hex}_p{page_number}.png"
+        output_path = os.path.join("uploads", output_name)
+        pix.save(output_path)
+        image_paths.append(output_path)
+    doc.close()
+    return image_paths
+
+
+def split_document_items(value: Any) -> List[str]:
+    if not value or value == "Не указано":
+        return []
+    if isinstance(value, (list, tuple)):
+        items = value
+    else:
+        items = re.split(r"[;\n]+", str(value))
+    cleaned = []
+    for item in items:
+        text = normalize_document_item(item)
+        if text:
+            cleaned.append(fix_number_spacing(text))
+    return cleaned
+
+
+def build_document_groups_from_data(claim_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    applications = split_document_items(claim_data.get("contract_applications"))
+    invoices = split_document_items(claim_data.get("invoice_blocks"))
+    acts = split_document_items(claim_data.get("upd_blocks"))
+    cargo = split_document_items(claim_data.get("cargo_docs"))
+
+    groups: List[Dict[str, Any]] = []
+    if applications:
+        for index, app in enumerate(applications):
+            items = []
+            if len(invoices) == len(applications):
+                items.append(invoices[index])
+            if len(acts) == len(applications):
+                items.append(acts[index])
+            if len(cargo) == len(applications):
+                items.append(cargo[index])
+            groups.append({"application": app, "documents": items})
+
+        leftovers = []
+        for docs in (invoices, acts, cargo):
+            if docs and len(docs) != len(applications):
+                leftovers.extend(docs)
+        if leftovers:
+            groups.append({"application": None, "documents": leftovers})
+        return groups
+
+    documents = invoices + acts + cargo
+    if documents:
+        groups.append({"application": None, "documents": documents})
+    return groups
+
+
+def build_document_groups(text: str, claim_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    llm_payload = extract_document_groups_llm(text)
+    groups: List[Dict[str, Any]] = []
+
+    if llm_payload:
+        for group in llm_payload.get("document_groups", []):
+            application = group.get("application")
+            documents = group.get("documents", []) or []
+            if application or documents:
+                groups.append({
+                    "application": normalize_document_item(application) if application else None,
+                    "documents": [normalize_document_item(doc) for doc in documents if doc],
+                })
+        ungrouped = llm_payload.get("ungrouped_documents", []) or []
+        if ungrouped:
+            groups.append({
+                "application": None,
+                "documents": [normalize_document_item(doc) for doc in ungrouped if doc],
+            })
+
+    if not groups:
+        groups = build_document_groups_from_data(claim_data)
+
+    # Remove duplicates while preserving order
+    cleaned_groups = []
+    seen = set()
+    for group in groups:
+        app = group.get("application")
+        docs = group.get("documents", []) or []
+        key = (app or "", tuple(docs))
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned_groups.append({"application": app, "documents": docs})
+
+    return cleaned_groups
+
+
+def build_documents_list_structured(
+    groups: List[Dict[str, Any]]
+) -> Optional[List[Tuple[int, str]]]:
+    if not groups:
+        return None
+    structured: List[Tuple[int, str]] = []
+    index = 1
+    for group in groups:
+        application = group.get("application")
+        documents = group.get("documents", []) or []
+        if application:
+            structured.append((0, f"{index}. {application}"))
+            for doc in documents:
+                structured.append((1, doc))
+            index += 1
+        else:
+            for doc in documents:
+                structured.append((0, f"{index}. {doc}"))
+                index += 1
+    return structured or None
+
+
+def build_party_block(
+    label: str,
+    name: str,
+    inn: str,
+    kpp: str,
+    ogrn: str,
+    ogrn_label: str,
+    address: str,
+    postal_address: str,
+    is_ip: bool
+) -> str:
+    lines = [f"{label}: {name}"]
+    if inn and inn != "Не указано":
+        lines.append(f"ИНН {inn}")
+    if not is_ip and kpp and kpp != "Не указано":
+        lines.append(f"КПП {kpp}")
+    if ogrn and ogrn != "Не указано":
+        lines.append(f"{ogrn_label} {ogrn}")
+    if address and address != "Не указано":
+        lines.append(address)
+    if (
+        postal_address
+        and postal_address != "Не указано"
+        and postal_address != address
+    ):
+        lines.append(f"Почтовый адрес: {postal_address}")
+    return "\n".join(lines)
+
+
+def build_intro_paragraph(
+    plaintiff_name_short: str,
+    applications: List[str],
+    cargo_docs: List[str]
+) -> str:
+    parts = []
+    if applications:
+        parts.append(", ".join(applications))
+    if cargo_docs:
+        parts.append(", ".join(cargo_docs))
+    documents_text = ", ".join(parts)
+    if documents_text:
+        documents_text = f", что подтверждается {documents_text}."
+    else:
+        documents_text = "."
+    return (
+        f"{plaintiff_name_short} надлежащим образом выполнил(а) перевозку "
+        "по указанным заявкам. Услуги оказаны своевременно и в полном объёме; "
+        "приняты Заказчиком без замечаний и претензий"
+        f"{documents_text}"
+    )
+
+
+def build_requirements_summary(
+    debt_amount: float,
+    total_interest: float,
+    legal_fees: float
+) -> str:
+    parts = []
+    if debt_amount > 0:
+        parts.append(
+            f"{format_money(debt_amount, 0)} руб. — задолженность по оплате"
+        )
+    if total_interest > 0:
+        parts.append(
+            f"{format_money(total_interest, 2)} руб. — проценты "
+            "за пользование чужими денежными средствами"
+        )
+    if legal_fees > 0:
+        parts.append(
+            f"{format_money(legal_fees, 2)} руб. — юридические услуги"
+        )
+    if not parts:
+        return "Таким образом, размер требований составляет: Не указано."
+    return "Таким образом, размер требований составляет: " + "; ".join(parts) + "."
+
+
+def build_legal_fees_block(claim_data: Dict[str, Any]) -> str:
+    legal_fees = parse_amount(claim_data.get("legal_fees", 0))
+    if legal_fees <= 0:
+        return ""
+    contract_number = normalize_str(
+        claim_data.get("legal_contract_number"),
+        default=""
+    )
+    contract_date = normalize_str(
+        claim_data.get("legal_contract_date"),
+        default=""
+    )
+    payment_number = normalize_str(
+        claim_data.get("legal_payment_number"),
+        default=""
+    )
+    payment_date = normalize_str(
+        claim_data.get("legal_payment_date"),
+        default=""
+    )
+    parts = [
+        "Между Исполнителем и представителем заключён Договор оказания "
+        "юридических услуг"
+    ]
+    if contract_number or contract_date:
+        details = []
+        if contract_number:
+            details.append(f"№ {contract_number}")
+        if contract_date:
+            details.append(f"от {contract_date}")
+        parts.append(" " + " ".join(details) + ".")
+    else:
+        parts.append(".")
+
+    if payment_number or payment_date:
+        payment_parts = []
+        if payment_number:
+            payment_parts.append(f"№ {payment_number}")
+        if payment_date:
+            payment_parts.append(f"от {payment_date}")
+        parts.append(
+            "Оплата по договору произведена Платёжным поручением "
+            + " ".join(payment_parts)
+            + f" на сумму {format_money(legal_fees, 2)} руб."
+        )
+    else:
+        parts.append(
+            f"Оплата по договору произведена на сумму "
+            f"{format_money(legal_fees, 2)} руб."
+        )
+    parts.append(
+        "Расходы на представителя подлежат возмещению в порядке ст. 106, 110 "
+        "АПК РФ, а также ст. 15, 393 ГК РФ и будут заявлены при обращении в суд."
+    )
+    return " ".join(parts)
+
+
+def build_pretension_attachments(
+    document_groups: List[Dict[str, Any]],
+    claim_data: Dict[str, Any]
+) -> List[str]:
+    items: List[str] = []
+    seen = set()
+
+    def add_item(text: str) -> None:
+        cleaned = normalize_document_item(text)
+        key = normalize_attachment_text(cleaned)
+        if not key or key in seen:
+            return
+        seen.add(key)
+        items.append(cleaned)
+
+    for group in document_groups:
+        application = group.get("application")
+        if application:
+            add_item(f"{application} - копия")
+        for doc in group.get("documents", []) or []:
+            add_item(f"{doc} - копия")
+
+    postal_number = get_first_list_value(claim_data.get("postal_numbers", []))
+    postal_date = get_first_list_value(claim_data.get("postal_dates", []))
+    if postal_number or postal_date:
+        add_item("Почтовая квитанция и отчет об отправке оригиналов документов – копия")
+
+    legal_fees = parse_amount(claim_data.get("legal_fees", 0))
+    if legal_fees > 0:
+        contract_number = normalize_str(
+            claim_data.get("legal_contract_number"),
+            default=""
+        )
+        contract_date = normalize_str(
+            claim_data.get("legal_contract_date"),
+            default=""
+        )
+        contract_parts = []
+        if contract_number:
+            contract_parts.append(f"№ {contract_number}")
+        if contract_date:
+            contract_parts.append(f"от {contract_date}")
+        if contract_parts:
+            add_item(
+                "Договор оказания юридических услуг "
+                + " ".join(contract_parts)
+                + " - копия"
+            )
+        payment_number = normalize_str(
+            claim_data.get("legal_payment_number"),
+            default=""
+        )
+        payment_date = normalize_str(
+            claim_data.get("legal_payment_date"),
+            default=""
+        )
+        payment_parts = []
+        if payment_number:
+            payment_parts.append(f"№ {payment_number}")
+        if payment_date:
+            payment_parts.append(f"от {payment_date}")
+        if payment_parts:
+            add_item(
+                "Платежное поручение "
+                + " ".join(payment_parts)
+                + " - копия"
+            )
+
+    return items
+
+
+def calculate_pretension_interest(
+    debt_amount: float,
+    start_date: datetime,
+    end_date: Optional[datetime] = None
+) -> Dict[str, Any]:
+    if debt_amount <= 0:
+        return {"total_interest": 0.0, "detailed_calc": []}
+    if end_date is None:
+        end_date = datetime.today()
+    if start_date > end_date:
+        return {"total_interest": 0.0, "detailed_calc": []}
+
+    key_rates = get_key_rates_from_395gk()
+    periods = split_period_by_key_rate(start_date, end_date, key_rates)
+    total_interest, detailed_calc = calc_395_on_periods(debt_amount, periods)
+    return {
+        "total_interest": total_interest,
+        "detailed_calc": detailed_calc,
+    }
+
+
 def replace_placeholders_robust(doc, replacements):
     """
     Заменяет плейсхолдеры в документе, применяя жирное начертание
@@ -745,6 +1336,14 @@ def replace_placeholders_robust(doc, replacements):
         'Цена иска:',
         'Государственная пошлина:'
     ]
+    multiline_placeholders = {
+        'documents_list',
+        'defendant_block',
+        'plaintiff_block',
+        'intro_paragraph',
+        'legal_fees_block',
+        'requirements_summary',
+    }
 
     is_plaintiff_ip = (
         'ИП' in str(replacements.get('{plaintiff_name}', '')) or
@@ -891,7 +1490,8 @@ def replace_placeholders_robust(doc, replacements):
                 if key in full_text:
                     replaced_any = True
                     value = replacements[key]
-                    if key.strip('{}') == 'documents_list':
+                    placeholder_name = key.strip('{}')
+                    if placeholder_name in multiline_placeholders:
                         clean_value = str(value).replace('\r', '').strip()
                     else:
                         clean_value = str(value).replace(
@@ -1072,7 +1672,11 @@ def build_f107_items(
     return final_items
 
 
-def replace_attachments_with_paragraphs(doc, attachments):
+def replace_attachments_with_paragraphs(
+    doc,
+    attachments,
+    use_claim_extras: bool = True
+):
     """
     Заменяет плейсхолдер {attachments} списком приложений с нумерацией и добавляет заголовок 'Приложения:'.
     Ожидается, что в шаблоне только {attachments} на отдельной строке.
@@ -1123,13 +1727,23 @@ def replace_attachments_with_paragraphs(doc, attachments):
                 if (
                     "{{plaintiff_name_short}}" in text
                     or "{plaintiff_name_short}" in text
+                    or text.startswith("Дата:")
                     or re.match(r"^_+", text)
                 ):
                     break
                 p = paragraph._element
                 parent.remove(p)
 
-        final_attachments = build_isk_attachments_list(attachments)
+        if use_claim_extras:
+            final_attachments = build_isk_attachments_list(attachments)
+        else:
+            if isinstance(attachments, str):
+                attachments = [attachments]
+            final_attachments = [
+                fix_number_spacing(normalize_document_item(att))
+                for att in (attachments or [])
+                if att and str(att).strip() != "Не указано"
+            ]
 
         # Динамические приложения с нумерацией
         attachment_number = 1
@@ -1520,7 +2134,86 @@ def create_isk_document(
     return output_path
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def remove_legal_fees_section(doc) -> None:
+    """
+    Удаляет блок про юридические услуги, если он пустой.
+    """
+    header_idx = None
+    for i, paragraph in enumerate(doc.paragraphs):
+        if paragraph.text.strip().startswith("5. Договор об оказании юридических услуг"):
+            header_idx = i
+            break
+    if header_idx is None:
+        return
+    indices = [header_idx]
+    if header_idx + 1 < len(doc.paragraphs):
+        next_text = doc.paragraphs[header_idx + 1].text.strip()
+        if not next_text or "юридических услуг" in next_text.lower():
+            indices.append(header_idx + 1)
+    for idx in sorted(indices, reverse=True):
+        p = doc.paragraphs[idx]._element
+        p.getparent().remove(p)
+
+
+def create_pretension_document(
+    data: dict,
+    interest_data: dict,
+    replacements: dict,
+    documents_list_structured: Optional[List[Tuple[int, str]]] = None,
+    attachments: Optional[List[str]] = None,
+    output_path: Optional[str] = None
+) -> str:
+    template_dir = os.path.dirname(__file__)
+    candidate_templates = [
+        os.path.join(template_dir, "templates", "template_pretension.docx"),
+        os.path.join(template_dir, "template_pretension.docx"),
+        os.path.join(template_dir, "templates", "ПРЕТЕНЗИЯ.docx"),
+        os.path.join(template_dir, "ПРЕТЕНЗИЯ.docx"),
+    ]
+    template_path = next(
+        (path for path in candidate_templates if os.path.exists(path)),
+        None
+    )
+    if template_path is None:
+        raise FileNotFoundError("Шаблон претензии не найден.")
+
+    doc = Document(template_path)
+    replacements = replacements.copy()
+    if documents_list_structured:
+        inserted = replace_documents_list_with_paragraphs(
+            doc,
+            documents_list_structured
+        )
+        if inserted:
+            replacements.pop("{documents_list}", None)
+            replacements.pop("{{documents_list}}", None)
+
+    replace_placeholders_robust(doc, expand_placeholder_map(replacements))
+
+    legal_block = replacements.get("{legal_fees_block}", "")
+    if not str(legal_block).strip():
+        remove_legal_fees_section(doc)
+
+    replace_attachments_with_paragraphs(
+        doc,
+        attachments or [],
+        use_claim_extras=False
+    )
+    number_attachments_section(doc)
+    insert_interest_table(
+        doc,
+        interest_data.get("detailed_calc", []),
+        interest_data.get("total_interest")
+    )
+
+    if output_path is None:
+        output_name = f"Претензия_{uuid.uuid4().hex}.docx"
+        output_path = os.path.join(os.path.dirname(__file__), output_name)
+    doc.save(output_path)
+    return output_path
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
     Обработчик команды /start.
 
@@ -1533,10 +2226,53 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"Received /start command from user {update.effective_user.id}"
         )
     if update.message:
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "🧾 Исковое заявление",
+                    callback_data="flow_claim"
+                ),
+                InlineKeyboardButton(
+                    "📄 Претензия",
+                    callback_data="flow_pretension"
+                ),
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(
-            'Отправь .docx файл с досудебным требованием — '
-            'я верну исковое заявление в формате Word.'
+            "Что нужно составить?",
+            reply_markup=reply_markup
         )
+    return ASK_FLOW
+
+
+async def flow_chosen(update, context):
+    query = update.callback_query
+    await query.answer()
+    choice = query.data
+
+    if choice == "flow_claim":
+        context.user_data.clear()
+        context.user_data["flow"] = "claim"
+        await query.edit_message_text(
+            "Отправь .docx файл с досудебным требованием — "
+            "я верну исковое заявление в формате Word."
+        )
+        return ASK_DOCUMENT
+
+    if choice == "flow_pretension":
+        context.user_data.clear()
+        context.user_data["flow"] = "pretension"
+        await query.edit_message_text(
+            "Отправь PDF-файл с документами по перевозке. "
+            "Я подготовлю претензию в формате Word."
+        )
+        return ASK_DOCUMENT
+
+    await query.edit_message_text(
+        "Не удалось определить выбор. Попробуй снова /start."
+    )
+    return ConversationHandler.END
 
 
 async def ask_claim_status(update, context):
@@ -2121,7 +2857,7 @@ async def ask_claim_status_after_jurisdiction(update_or_query, context):
     return ASK_CLAIM_STATUS
 
 
-async def handle_doc_entry(update, context):
+async def handle_docx_entry(update, context):
     try:
         if update.effective_user:
             logging.info(
@@ -2173,9 +2909,359 @@ async def handle_doc_entry(update, context):
             )
 
 
+def is_missing_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, list):
+        return len(value) == 0
+    text = str(value).strip()
+    return not text or text == "Не указано"
+
+
+def get_pretension_missing_fields(data: Dict[str, Any]) -> List[str]:
+    missing = []
+    for key in PRETENSION_FIELD_ORDER:
+        value = data.get(key)
+        if key == "debt":
+            if parse_amount(value, 0) <= 0:
+                missing.append(key)
+            continue
+        if key == "payment_days":
+            try:
+                days = int(re.sub(r"[^\d]", "", str(value)))
+            except ValueError:
+                days = 0
+            if days <= 0:
+                missing.append(key)
+            continue
+        if key == "docs_received_date":
+            if parse_date_str(str(value or "")) is None:
+                missing.append(key)
+            continue
+        if key == "docs_track_number":
+            if is_missing_value(value):
+                missing.append(key)
+            continue
+        if is_missing_value(value):
+            missing.append(key)
+    return missing
+
+
+async def ask_next_pretension_field(update, context):
+    missing = context.user_data.get("pretension_missing_fields", [])
+    if not missing:
+        return await finish_pretension(update, context)
+
+    key = missing[0]
+    prompt = PRETENSION_FIELD_DEFS.get(key, {}).get("prompt")
+    if not prompt:
+        missing.pop(0)
+        context.user_data["pretension_missing_fields"] = missing
+        return await ask_next_pretension_field(update, context)
+
+    target = None
+    if getattr(update, "message", None):
+        target = update.message
+    elif getattr(update, "callback_query", None):
+        target = update.callback_query.message
+    if target:
+        await target.reply_text(prompt)
+    return ASK_PRETENSION_FIELD
+
+
+async def handle_pretension_document(update, context):
+    doc = update.message.document if update.message else None
+    if not doc or not doc.file_name:
+        await update.message.reply_text('Пожалуйста, отправь PDF-файл.')
+        return ASK_DOCUMENT
+    if not doc.file_name.lower().endswith('.pdf'):
+        await update.message.reply_text('Пожалуйста, отправь PDF-файл.')
+        return ASK_DOCUMENT
+
+    os.makedirs('uploads', exist_ok=True)
+    unique_name = f"{uuid.uuid4()}_{doc.file_name}"
+    file_path = os.path.join('uploads', unique_name)
+    telegram_file = await doc.get_file()
+    await telegram_file.download_to_drive(file_path)
+    context.user_data['file_path'] = file_path
+
+    try:
+        text, low_text_pages = extract_pdf_text(file_path)
+    except Exception as exc:
+        await update.message.reply_text(
+            f"Не удалось прочитать PDF: {exc}"
+        )
+        return ASK_DOCUMENT
+
+    if low_text_pages:
+        pages_list = ", ".join(str(page) for page in low_text_pages)
+        await update.message.reply_text(
+            "⚠️ Текст распознан плохо на страницах: "
+            f"{pages_list}. Возможно, часть данных придется ввести вручную."
+        )
+        image_paths = render_pdf_pages(file_path, low_text_pages)
+        if image_paths:
+            await update.message.reply_text(
+                "Показываю страницы с плохим распознаванием (первые несколько):"
+            )
+            for path in image_paths:
+                with open(path, "rb") as handle:
+                    await update.message.reply_photo(InputFile(handle))
+            for path in image_paths:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+    claim_data = parse_documents_with_sliding_window(text)
+    claim_data = apply_llm_fallback(text, claim_data)
+    claim_data["document_groups"] = build_document_groups(text, claim_data)
+    claim_data["docs_received_date"] = get_first_list_value(
+        claim_data.get("postal_dates", [])
+    )
+    claim_data["docs_track_number"] = get_first_list_value(
+        claim_data.get("postal_numbers", [])
+    )
+    context.user_data["pretension_data"] = claim_data
+
+    missing = get_pretension_missing_fields(claim_data)
+    context.user_data["pretension_missing_fields"] = missing
+    if missing:
+        return await ask_next_pretension_field(update, context)
+    return await finish_pretension(update, context)
+
+
+async def handle_pretension_field(update, context):
+    data = context.user_data.get("pretension_data", {})
+    missing = context.user_data.get("pretension_missing_fields", [])
+    if not missing:
+        return await finish_pretension(update, context)
+
+    key = missing[0]
+    raw = update.message.text.strip() if update.message else ""
+    field_def = PRETENSION_FIELD_DEFS.get(key, {})
+    required = field_def.get("required", True)
+
+    if raw.lower() == "пропустить" and not required:
+        data[key] = ""
+        missing.pop(0)
+        context.user_data["pretension_data"] = data
+        context.user_data["pretension_missing_fields"] = missing
+        return await ask_next_pretension_field(update, context)
+
+    if key == "debt":
+        amount = parse_amount(raw, 0)
+        if amount <= 0:
+            await update.message.reply_text(
+                "Введите сумму задолженности в рублях (например: 210000)."
+            )
+            return ASK_PRETENSION_FIELD
+        data[key] = format_money(amount, 0)
+    elif key == "payment_days":
+        digits = re.sub(r"[^\d]", "", raw)
+        if not digits:
+            await update.message.reply_text(
+                "Введите срок оплаты числом (например: 15)."
+            )
+            return ASK_PRETENSION_FIELD
+        data[key] = digits
+    elif key == "docs_received_date":
+        parsed = parse_date_str(raw)
+        if not parsed:
+            await update.message.reply_text(
+                "Введите дату в формате ДД.ММ.ГГГГ."
+            )
+            return ASK_PRETENSION_FIELD
+        data[key] = parsed.strftime("%d.%m.%Y")
+    elif key == "docs_track_number":
+        data[key] = normalize_tracking_number(raw)
+    else:
+        data[key] = raw
+
+    missing.pop(0)
+    context.user_data["pretension_data"] = data
+    context.user_data["pretension_missing_fields"] = missing
+    if missing:
+        return await ask_next_pretension_field(update, context)
+    return await finish_pretension(update, context)
+
+
+async def finish_pretension(update, context):
+    file_path = context.user_data.get("file_path")
+    if not file_path or not os.path.exists(file_path):
+        await update.message.reply_text(
+            "Ошибка: файл не найден на диске."
+        )
+        return ConversationHandler.END
+
+    claim_data = context.user_data.get("pretension_data", {})
+    document_groups = claim_data.get("document_groups", []) or []
+
+    if claim_data.get("docs_track_number") and not claim_data.get("postal_numbers"):
+        claim_data["postal_numbers"] = [claim_data.get("docs_track_number")]
+    if claim_data.get("docs_received_date") and not claim_data.get("postal_dates"):
+        claim_data["postal_dates"] = [claim_data.get("docs_received_date")]
+
+    plaintiff_name = normalize_str(claim_data.get("plaintiff_name"))
+    defendant_name = normalize_str(claim_data.get("defendant_name"))
+    plaintiff_name_short = format_organization_name_short(plaintiff_name)
+    defendant_name_short = format_organization_name_short(defendant_name)
+    is_plaintiff_ip = "ИП" in plaintiff_name or "Индивидуальный предприниматель" in plaintiff_name
+    is_defendant_ip = "ИП" in defendant_name or "Индивидуальный предприниматель" in defendant_name
+
+    debt_amount = parse_amount(claim_data.get("debt", "0"))
+    payment_days_raw = claim_data.get("payment_days", "0")
+    try:
+        payment_days = int(re.sub(r"[^\d]", "", str(payment_days_raw)))
+    except ValueError:
+        payment_days = 0
+
+    docs_received_date = parse_date_str(claim_data.get("docs_received_date", ""))
+    interest_data = {"total_interest": 0.0, "detailed_calc": []}
+    if docs_received_date and payment_days > 0 and debt_amount > 0:
+        calendar = load_work_calendar(docs_received_date.year)
+        due_date = add_working_days(
+            docs_received_date,
+            payment_days,
+            calendar
+        )
+        interest_start = due_date + timedelta(days=1)
+        interest_data = calculate_pretension_interest(
+            debt_amount,
+            interest_start
+        )
+    total_interest = parse_amount(interest_data.get("total_interest", 0))
+    legal_fees_value = parse_amount(claim_data.get("legal_fees", 0))
+
+    payment_terms_text = normalize_payment_terms(
+        claim_data.get("payment_terms", "")
+    )
+    if not payment_terms_text or payment_terms_text == "Не указано":
+        if payment_days > 0:
+            payment_terms_text = (
+                f"отсрочка платежа (раб. дней): {payment_days}"
+            )
+        else:
+            payment_terms_text = "Не указано"
+
+    applications = [
+        group.get("application")
+        for group in document_groups
+        if group.get("application")
+    ]
+    cargo_docs = split_document_items(claim_data.get("cargo_docs"))
+    intro_paragraph = build_intro_paragraph(
+        plaintiff_name_short,
+        applications,
+        cargo_docs
+    )
+
+    plaintiff_ogrn_type = get_ogrn_label(
+        plaintiff_name,
+        claim_data.get("plaintiff_inn", "")
+    )
+    defendant_ogrn_type = get_ogrn_label(
+        defendant_name,
+        claim_data.get("defendant_inn", "")
+    )
+
+    defendant_block = build_party_block(
+        "Кому",
+        defendant_name,
+        normalize_str(claim_data.get("defendant_inn")),
+        normalize_str(claim_data.get("defendant_kpp")),
+        normalize_str(claim_data.get("defendant_ogrn")),
+        defendant_ogrn_type,
+        normalize_str(claim_data.get("defendant_address")),
+        normalize_str(claim_data.get("defendant_address")),
+        is_defendant_ip
+    )
+    plaintiff_block = build_party_block(
+        "От кого",
+        plaintiff_name,
+        normalize_str(claim_data.get("plaintiff_inn")),
+        normalize_str(claim_data.get("plaintiff_kpp")),
+        normalize_str(claim_data.get("plaintiff_ogrn")),
+        plaintiff_ogrn_type,
+        normalize_str(claim_data.get("plaintiff_address")),
+        normalize_str(claim_data.get("plaintiff_address")),
+        is_plaintiff_ip
+    )
+
+    documents_list_structured = build_documents_list_structured(document_groups)
+    attachments = build_pretension_attachments(document_groups, claim_data)
+
+    replacements = {
+        "{defendant_block}": defendant_block,
+        "{plaintiff_block}": plaintiff_block,
+        "{intro_paragraph}": intro_paragraph,
+        "{documents_list}": build_documents_list(claim_data),
+        "{debt_amount}": format_money(debt_amount, 0),
+        "{payment_terms}": payment_terms_text,
+        "{legal_fees_block}": build_legal_fees_block(claim_data),
+        "{requirements_summary}": build_requirements_summary(
+            debt_amount,
+            total_interest,
+            legal_fees_value
+        ),
+        "{pretension_date}": format_russian_date(),
+        "{docs_track_number}": normalize_str(
+            claim_data.get("docs_track_number", ""),
+            default=""
+        ),
+        "{docs_received_date}": normalize_str(
+            claim_data.get("docs_received_date", ""),
+            default=""
+        ),
+        "{plaintiff_name}": plaintiff_name,
+        "{defendant_name}": defendant_name,
+    }
+
+    result_docx = create_pretension_document(
+        claim_data,
+        interest_data,
+        replacements,
+        documents_list_structured=documents_list_structured,
+        attachments=attachments
+    )
+
+    with open(result_docx, "rb") as f:
+        await update.message.reply_document(
+            InputFile(f, filename="Претензия.docx"),
+            caption="Претензия по документам перевозки"
+        )
+
+    try:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        if os.path.exists(result_docx):
+            os.remove(result_docx)
+    except Exception as exc:
+        logging.warning("Не удалось удалить временные файлы: %s", exc)
+
+    return ConversationHandler.END
+
+
+async def handle_document(update, context):
+    flow = context.user_data.get("flow")
+    if flow == "claim":
+        return await handle_docx_entry(update, context)
+    if flow == "pretension":
+        return await handle_pretension_document(update, context)
+    if update.message:
+        await update.message.reply_text(
+            "Сначала выбери тип документа через /start."
+        )
+    return ConversationHandler.END
+
+
 conv_handler = ConversationHandler(
-    entry_points=[MessageHandler(filters.Document.ALL, handle_doc_entry)],
+    entry_points=[CommandHandler("start", start)],
     states={
+        ASK_FLOW: [CallbackQueryHandler(flow_chosen)],
+        ASK_DOCUMENT: [
+            MessageHandler(filters.Document.ALL, handle_document)
+        ],
         ASK_JURISDICTION: [CallbackQueryHandler(jurisdiction_chosen)],
         ASK_CUSTOM_COURT: [
             MessageHandler(filters.TEXT & ~filters.COMMAND, handle_custom_court)
@@ -2189,6 +3275,9 @@ conv_handler = ConversationHandler(
         ],
         ASK_SEND_DATE: [
             MessageHandler(filters.TEXT & ~filters.COMMAND, ask_send_date)
+        ],
+        ASK_PRETENSION_FIELD: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pretension_field)
         ],
     },
     fallbacks=[],
@@ -2244,7 +3333,6 @@ def main() -> None:
             "TOKEN is not set. Please provide a valid Telegram bot token.")
     app = Application.builder().token(TOKEN).build()
     logging.info("Bot initialized")
-    app.add_handler(CommandHandler("start", start))
     app.add_handler(conv_handler)
     logging.info("Handlers added")
     app.run_polling()

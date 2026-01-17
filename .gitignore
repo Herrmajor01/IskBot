@@ -28,6 +28,7 @@ wheels/
 # Logs
 *.log
 bot.log
+work_calendar_cache.json
 
 # IDE
 .vscode/

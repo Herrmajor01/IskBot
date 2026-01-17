@@ -481,10 +481,13 @@ def apply_llm_fallback(text: str, data: Dict[str, Any]) -> Dict[str, Any]:
 
     missing_fields = [
         "plaintiff_name", "plaintiff_inn", "plaintiff_ogrn",
-        "plaintiff_address",
+        "plaintiff_address", "plaintiff_kpp",
         "defendant_name", "defendant_inn", "defendant_ogrn",
-        "defendant_address",
-        "debt", "payment_terms", "postal_numbers", "postal_dates",
+        "defendant_address", "defendant_kpp",
+        "debt", "payment_terms", "payment_days", "payment_due_date",
+        "postal_numbers", "postal_dates",
+        "legal_fees", "legal_contract_number", "legal_contract_date",
+        "legal_payment_number", "legal_payment_date",
     ]
 
     def is_missing(value: Any) -> bool:
@@ -531,3 +534,101 @@ def apply_llm_fallback(text: str, data: Dict[str, Any]) -> Dict[str, Any]:
         if is_missing(merged.get(key)):
             merged[key] = value
     return merged
+
+
+def _build_document_groups_prompt(text: str) -> str:
+    schema = {
+        "document_groups": [
+            {
+                "application": "string|null",
+                "documents": ["string"],
+            }
+        ],
+        "ungrouped_documents": ["string"],
+    }
+    return (
+        "Ты анализируешь документы по перевозке и группируешь их по заявкам.\n"
+        "Верни ТОЛЬКО JSON без комментариев.\n"
+        "Если связать документы с заявкой нельзя, помести их в ungrouped_documents.\n"
+        "Названия документов возвращай в виде готовых строк, например:\n"
+        "- \"Заявка № 123 от 01.01.2025\"\n"
+        "- \"Счет № 45 от 03.01.2025\"\n"
+        "- \"Акт № 45 от 05.01.2025\"\n"
+        "- \"Транспортная накладная № 789 от 06.01.2025\"\n"
+        "\n"
+        f"Схема: {json.dumps(schema, ensure_ascii=False)}\n"
+        "\n"
+        "Текст документов:\n"
+        f"{text}\n"
+        "\n"
+        "Верни JSON:\n"
+    )
+
+
+def _sanitize_document_groups(payload: Dict[str, Any]) -> Dict[str, Any]:
+    groups_raw = payload.get("document_groups") if isinstance(payload, dict) else None
+    ungrouped_raw = payload.get("ungrouped_documents") if isinstance(payload, dict) else None
+
+    groups_clean: List[Dict[str, Any]] = []
+    if isinstance(groups_raw, list):
+        for group in groups_raw:
+            if not isinstance(group, dict):
+                continue
+            application = _clean_str(group.get("application"))
+            documents = _clean_list(group.get("documents"))
+            documents = [doc for doc in documents if doc]
+            if not application and not documents:
+                continue
+            groups_clean.append({
+                "application": application,
+                "documents": documents,
+            })
+
+    ungrouped_clean = _clean_list(ungrouped_raw)
+    ungrouped_clean = [doc for doc in ungrouped_clean if doc]
+
+    return {
+        "document_groups": groups_clean,
+        "ungrouped_documents": ungrouped_clean,
+    }
+
+
+def extract_document_groups_llm(text: str) -> Optional[Dict[str, Any]]:
+    """
+    Извлекает группы документов по заявкам через LLM.
+    """
+    config = get_llm_config()
+    if not config["enabled"] or not config["base_url"]:
+        logger.debug("LLM document groups disabled or no base_url configured")
+        return None
+
+    if not check_ollama_health(config):
+        logger.warning(
+            f"Ollama API not available at {config['base_url']}, "
+            "skipping document groups extraction"
+        )
+        return None
+
+    trimmed = text[: config["max_chars"]] if config["max_chars"] else text
+    prompt = _build_document_groups_prompt(trimmed)
+    try:
+        raw_response = _call_ollama(prompt, config)
+        logger.info(
+            "LLM document groups response received: %s chars",
+            len(raw_response or "")
+        )
+    except Exception as exc:
+        logger.warning("LLM document groups extraction failed: %s", exc)
+        return None
+
+    parsed = _extract_json(raw_response or "")
+    if not parsed:
+        logger.warning("LLM document groups returned no JSON")
+        return None
+
+    sanitized = _sanitize_document_groups(parsed)
+    if not sanitized.get("document_groups") and not sanitized.get("ungrouped_documents"):
+        logger.warning("LLM document groups returned empty result")
+        return None
+
+    return sanitized
