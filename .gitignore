@@ -2,6 +2,7 @@
 venv/
 env/
 ENV/
+.venv/
 
 # Python
 __pycache__/
@@ -51,3 +52,7 @@ Thumbs.db
 .env.development.local
 .env.test.local
 .env.production.local
+
+# Case registry
+cases/*.sqlite
+case_registry.sqlite

@@ -16,6 +16,200 @@ logging.basicConfig(
 )
 
 
+def _parse_numeric_value(text: str) -> Optional[float]:
+    cleaned = re.sub(r'[^\d.,+\-]', '', text or '')
+    cleaned = cleaned.strip().rstrip('.').rstrip(',')
+    if not cleaned or cleaned in ('+', '-'):
+        return None
+    if not re.match(r'^[\+\-]?\d+([.,]\d+)?$', cleaned):
+        return None
+    return float(cleaned.replace(',', '.'))
+
+
+def _parse_int_value(text: str) -> Optional[int]:
+    cleaned = re.sub(r'[^\d]', '', text or '')
+    if not cleaned:
+        return None
+    try:
+        return int(cleaned)
+    except ValueError:
+        return None
+
+
+def _parse_periods_from_rows(
+    rows: List[List[str]]
+) -> Tuple[List[Dict[str, Any]], float]:
+    date_pattern = re.compile(r'\d{2}\.\d{2}\.\d{4}')
+    periods: List[Dict[str, Any]] = []
+    current_sum = 0.0
+
+    for row in rows[1:]:
+        if not row:
+            continue
+
+        amount_text = (row[0] or '').strip()
+        if not amount_text:
+            continue
+        if re.search(r'[А-Яа-яA-Za-z]', amount_text):
+            skip_words = ["сумма", "задолж", "процент", "итого"]
+            if any(word in amount_text.lower() for word in skip_words):
+                continue
+
+        amount = _parse_numeric_value(amount_text)
+        if amount is None:
+            continue
+        if amount_text.lstrip().startswith('+'):
+            period_sum = current_sum + amount
+        else:
+            period_sum = amount
+
+        date_cells = []
+        for idx, cell in enumerate(row):
+            match = date_pattern.search(cell or '')
+            if match:
+                date_cells.append((idx, match.group(0)))
+        if len(date_cells) < 2:
+            continue
+
+        date_from_idx, date_from_text = date_cells[0]
+        date_to_idx, date_to_text = date_cells[1]
+        try:
+            date_from = datetime.strptime(date_from_text, '%d.%m.%Y')
+            date_to = datetime.strptime(date_to_text, '%d.%m.%Y')
+        except Exception:
+            continue
+
+        days = None
+        if date_to_idx + 1 < len(row):
+            days = _parse_int_value(row[date_to_idx + 1])
+        if not days or days <= 0:
+            continue
+
+        rate = None
+        for cell in row:
+            if '%' in (cell or ''):
+                rate = _parse_numeric_value(cell)
+                break
+        if rate is None:
+            for cell in row[date_to_idx + 2:]:
+                val = _parse_numeric_value(cell)
+                if val is None:
+                    continue
+                if 0 < val <= 100:
+                    rate = val
+                    break
+        if rate is None or rate <= 0:
+            continue
+
+        year_days = None
+        for cell in row:
+            val = _parse_int_value(cell)
+            if val in (365, 366):
+                year_days = val
+                break
+
+        current_sum = period_sum
+        periods.append({
+            'sum': period_sum,
+            'date_from': date_from,
+            'date_to': date_to,
+            'days': days,
+            'rate': rate,
+            'year_days': year_days,
+        })
+
+    if not periods:
+        raise ValueError("Не удалось распарсить ни одной строки из таблицы")
+    return periods, current_sum
+
+
+def extract_interest_table_rows(docx_path: str) -> List[List[str]]:
+    from docx import Document
+
+    doc = Document(docx_path)
+    if not doc.tables:
+        raise ValueError("В файле .docx отсутствует таблица")
+    table = doc.tables[0]
+    rows = []
+    for row in table.rows:
+        rows.append([cell.text.strip() for cell in row.cells])
+    if not rows:
+        raise ValueError("Таблица пуста")
+    return rows
+
+
+def _parse_date_value(value: str) -> Optional[datetime]:
+    try:
+        return datetime.strptime(value.strip(), "%d.%m.%Y")
+    except Exception:
+        return None
+
+
+def _format_decimal_ru(value: float, decimals: int = 2) -> str:
+    fmt = f"{value:,.{decimals}f}"
+    return fmt.replace(",", " ").replace(".", ",")
+
+
+def _format_integer_ru(value: float) -> str:
+    fmt = f"{value:,.0f}"
+    return fmt.replace(",", " ")
+
+
+def _update_interest_table_rows(
+    rows: List[List[str]],
+    new_end: datetime,
+    new_interest: float,
+    total_interest: float,
+    total_days: int,
+    average_rate: float,
+    new_days: int,
+    new_end_str: str
+) -> List[List[str]]:
+    updated = [row[:] for row in rows]
+
+    # Update last data row (the last row with date_from/date_to)
+    last_data_idx = None
+    for idx in range(len(updated) - 1, -1, -1):
+        row = updated[idx]
+        if not row:
+            continue
+        if row[0].strip().lower().startswith("итого"):
+            continue
+        if len(row) < 3:
+            continue
+        if _parse_date_value(row[1]) and _parse_date_value(row[2]):
+            last_data_idx = idx
+            break
+
+    if last_data_idx is not None:
+        row = updated[last_data_idx]
+        if len(row) >= 4:
+            row[2] = new_end_str
+            row[3] = str(new_days)
+        if row:
+            row[-1] = _format_decimal_ru(new_interest, 2)
+        updated[last_data_idx] = row
+
+    # Update total row
+    total_idx = None
+    for idx, row in enumerate(updated):
+        if row and row[0].strip().lower().startswith("итого"):
+            total_idx = idx
+            break
+
+    if total_idx is not None:
+        row = updated[total_idx]
+        if len(row) > 3:
+            row[3] = str(total_days)
+        if len(row) > 8:
+            row[8] = _format_decimal_ru(average_rate, 2) + "%"
+        if row:
+            row[-1] = _format_decimal_ru(total_interest, 2)
+        updated[total_idx] = row
+
+    return updated
+
+
 def parse_periods_from_docx(
     docx_path: str
 ) -> Tuple[List[Dict[str, Any]], float]:
@@ -31,109 +225,18 @@ def parse_periods_from_docx(
     table = doc.tables[0]
     if len(table.rows) == 0:
         raise ValueError("Таблица пуста")
-    max_cells = max(len(row.cells) for row in table.rows)
+
+    rows = []
+    for row in table.rows:
+        rows.append([cell.text.strip() for cell in row.cells])
+
+    max_cells = max(len(row) for row in rows)
     if max_cells < 6:
         raise ValueError(
             "Таблица должна содержать минимум 6 столбцов в строках данных"
         )
-    periods = []
-    current_sum = 0.0
-    for row in table.rows[1:]:
-        cells = row.cells
-        if len(cells) < 6:
-            continue
-        has_formula = len(cells) >= 7
-        try:
-            amount_text = cells[0].text.strip()
-            # Пропуск строк с текстом, а не суммой
-            if not amount_text:
-                continue
-            cleaned_for_check = re.sub(r'[^\d.,+\-]', '', amount_text)
-            if not cleaned_for_check:
-                continue
-            if re.search(r'[А-Яа-яA-Za-z]', amount_text):
-                skip_words = ["сумма", "задолж", "процент"]
-                if any(word in amount_text.lower() for word in skip_words):
-                    continue
-            amount_text = re.sub(r'[^\d.,+\-]', '', amount_text)
-            if not amount_text:
-                continue
-            amount_text = amount_text.rstrip('.').rstrip(',').rstrip()
-            if not amount_text:
-                continue
-            if not re.match(r'^[\+\-]?\d+([.,]\d+)?$', amount_text):
-                continue
-            try:
-                if amount_text.startswith('+'):
-                    amount = float(amount_text[1:].replace(',', '.'))
-                    current_sum += amount
-                else:
-                    current_sum = float(amount_text.replace(',', '.'))
-            except ValueError:
-                continue
-            date_from_text = cells[1].text.strip()
-            date_to_text = cells[2].text.strip()
-            if not date_from_text or not date_to_text:
-                continue
-            if date_to_text.lower() == "новая задолженность":
-                continue
-            date_pattern = r'\d{2}\.\d{2}\.\d{4}'
-            if (
-                not re.match(date_pattern, date_from_text)
-                or not re.match(date_pattern, date_to_text)
-            ):
-                continue
-            date_from = datetime.strptime(date_from_text, '%d.%m.%Y')
-            date_to = datetime.strptime(date_to_text, '%d.%m.%Y')
-            days_text = cells[3].text.strip()
-            if not days_text or not days_text.isdigit():
-                continue
-            days = int(days_text)
-            rate_text = cells[4].text.strip()
-            if not rate_text:
-                continue
-            rate_text = re.sub(r'[^\d.,]', '', rate_text)
-            if not rate_text:
-                continue
-            rate = float(rate_text.replace(',', '.'))
-            year_days = None
-            formula_text = ""
-            if has_formula:
-                formula_text = cells[5].text.strip()
-                year_days_text = cells[5].text.strip()
-                year_days_clean = re.sub(r'[^\d]', '', year_days_text)
-                if year_days_clean:
-                    year_days = int(year_days_clean)
-            interest_index = 6 if has_formula else 5
-            interest_text = cells[interest_index].text.strip()
-            if not interest_text:
-                continue
-            interest_text = re.sub(r'[^\d.,]', '', interest_text)
-            interest_text = interest_text.rstrip('.').rstrip(',').rstrip()
-            if not interest_text:
-                continue
-            if not re.match(r'^\d+([.,]\d+)?$', interest_text):
-                continue
-            try:
-                interest = float(interest_text.replace(',', '.'))
-            except ValueError:
-                continue
-            periods.append({
-                'sum': current_sum,
-                'date_from': date_from,
-                'date_to': date_to,
-                'days': days,
-                'rate': rate,
-                'interest': interest,
-                'year_days': year_days,
-                'formula': formula_text
-            })
-        except Exception as e:
-            logging.warning(f"Ошибка парсинга строки: {e}")
-            continue
-    if not periods:
-        raise ValueError("Не удалось распарсить ни одной строки из таблицы")
-    return periods, current_sum
+
+    return _parse_periods_from_rows(rows)
 
 
 def _load_cached_rates(
@@ -408,6 +511,7 @@ def calculate_full_395(
     if key_rates is None:
         key_rates = get_key_rates_from_395gk()
 
+    table_rows = None
     try:
         periods, base_sum = parse_periods_from_docx(docx_path)
     except Exception as exc:
@@ -423,6 +527,14 @@ def calculate_full_395(
             'periods_count': 0,
             'error': str(exc)
         }
+    try:
+        table_rows = extract_interest_table_rows(docx_path)
+    except Exception as exc:
+        logging.warning(
+            "Ошибка чтения таблицы процентов из %s: %s",
+            docx_path,
+            exc
+        )
 
     if not periods:
         return {
@@ -431,6 +543,33 @@ def calculate_full_395(
             'base_sum': base_sum,
             'error': 'Не найдены периоды для расчета'
         }
+
+    original_last = periods[-1]
+    replacement_periods: List[Dict[str, Any]] = []
+    if original_last['date_to'] < today:
+        split_periods = split_period_by_key_rate(
+            original_last['date_from'],
+            today,
+            key_rates
+        )
+        if not split_periods:
+            split_periods = [(original_last['date_from'], today, original_last['rate'])]
+        for start, end, rate in split_periods:
+            days = (end - start).days + 1
+            year_days = 366 if (
+                start.year % 4 == 0 and
+                start.year % 100 != 0 or
+                start.year % 400 == 0
+            ) else 365
+            replacement_periods.append({
+                'sum': original_last['sum'],
+                'date_from': start,
+                'date_to': end,
+                'days': days,
+                'rate': rate,
+                'year_days': year_days,
+            })
+        periods = periods[:-1] + replacement_periods
 
     # Расчет для каждого периода из таблицы
     total_interest = 0.0
@@ -465,41 +604,42 @@ def calculate_full_395(
             ).replace(',', ' ')
         })
 
-    # Проверяем, есть ли дополнительный период после последней даты
-    last = periods[-1]
-    logging.info(
-        f"Последняя дата в таблице: {last['date_to'].strftime('%d.%m.%Y г.')}")
-
-    if last['date_to'] < today:
-        actual_start = last['date_to'] + timedelta(days=1)
-        actual_end = today
-
-        logging.info(
-            f"Дополнительный период: "
-            f"{actual_start.strftime('%d.%m.%Y г.')} - "
-            f"{actual_end.strftime('%d.%m.%Y г.')}")
-
-        # Находим подходящие ставки для дополнительного периода
-        additional_periods = split_period_by_key_rate(
-            actual_start, actual_end, key_rates
+    updated_table_rows = None
+    if (
+        original_last['date_to'] < today
+        and len(replacement_periods) == 1
+        and table_rows
+    ):
+        new_end = replacement_periods[0]['date_to']
+        new_days = replacement_periods[0]['days']
+        new_rate = replacement_periods[0]['rate']
+        new_interest = (
+            original_last['sum'] * new_days * new_rate / 100
+            / replacement_periods[0]['year_days']
         )
-
-        if not additional_periods:
-            logging.warning(
-                "Не найдены ключевые ставки для дополнительного периода, "
-                "используется ставка 21%")
-            additional_periods = [(actual_start, actual_end, 21.0)]
-
-        # Расчет для дополнительного периода
-        additional_interest, additional_calc = calc_395_on_periods(
-            base_sum, additional_periods
+        total_days = sum(int(item.get('days', 0) or 0) for item in periods)
+        if total_days > 0:
+            avg_rate = sum(
+                float(item.get('rate', 0) or 0) * float(item.get('days', 0) or 0)
+                for item in periods
+            ) / total_days
+        else:
+            avg_rate = 0.0
+        updated_table_rows = _update_interest_table_rows(
+            table_rows,
+            new_end,
+            new_interest,
+            total_interest,
+            total_days,
+            avg_rate,
+            new_days,
+            new_end.strftime('%d.%m.%Y'),
         )
-        total_interest += additional_interest
-        detailed_calc.extend(additional_calc)
 
     return {
         'total_interest': total_interest,
         'detailed_calc': detailed_calc,
         'base_sum': base_sum,
-        'periods_count': len(periods)
+        'periods_count': len(periods),
+        'table_rows': updated_table_rows,
     }

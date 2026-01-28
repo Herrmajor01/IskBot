@@ -619,6 +619,13 @@ class SlidingWindowParser:
         normalized_words = [self.normalize_word(word) for word in words]
         return ' '.join(normalized_words)
 
+    def _normalize_doc_number(self, value: str) -> str:
+        number = re.sub(r'\s+', ' ', str(value)).strip()
+        number = number.replace('–', '-').replace('—', '-')
+        number = re.sub(r'\s*/\s*', '/', number)
+        number = re.sub(r'\s*-\s*', '-', number)
+        return number
+
     def extract_documents_advanced(self, text: str) -> Dict[str, List[DocumentBlock]]:
         """
         Улучшенное извлечение документов с группировкой по типам
@@ -778,7 +785,27 @@ class SlidingWindowParser:
             cleaned = re.sub(r'\s+', '', cleaned)
             return cleaned.replace(',', '.')
 
+        def parse_rubles_kopeks(
+            rubles_text: str,
+            kopeks_text: str
+        ) -> Optional[float]:
+            rubles_clean = re.sub(r'[^\d]', '', str(rubles_text))
+            if not rubles_clean:
+                return None
+            kopeks_clean = re.sub(r'[^\d]', '', str(kopeks_text or ''))
+            if not kopeks_clean:
+                kopeks_clean = '0'
+            kopeks_clean = kopeks_clean.zfill(2)[:2]
+            return float(f"{int(rubles_clean)}.{kopeks_clean}")
+
         # Извлекаем сумму задолженности
+        debt_with_kopeks_patterns = [
+            r'итого\s+задолженность\s*[:\-]?\s*([0-9\s]+)\s*руб[^\d]*([0-9]{1,2})\s*коп',
+            r'размер\s+требований\s+составляет[^0-9]*([0-9\s]+)\s*руб[^\d]*([0-9]{1,2})\s*коп[^.\n]*?задолж',
+            r'задолженность\s*[:\-]?\s*([0-9\s]+)\s*руб[^\d]*([0-9]{1,2})\s*коп',
+            r'размер задолженности[^0-9]*составляет\s*([0-9\s]+)\s*руб[^\d]*([0-9]{1,2})\s*коп',
+            r'задолженность[^0-9]*в размере\s*([0-9\s]+)\s*руб[^\d]*([0-9]{1,2})\s*коп',
+        ]
         debt_patterns = [
             r'итого\s+задолженность\s*[:\-]?\s*([0-9\s,]+)\s*руб',
             r'размер\s+требований\s+составляет[^0-9]*([0-9\s,]+)\s*руб[^\n]*?задолж',
@@ -791,18 +818,36 @@ class SlidingWindowParser:
         ]
 
         debt = None
-        for pattern in debt_patterns:
+        debt_has_kopeks = False
+        for pattern in debt_with_kopeks_patterns:
             debt_match = re.search(pattern, text, re.IGNORECASE)
             if debt_match:
-                debt_str = normalize_number(debt_match.group(1))
-                try:
-                    debt = float(debt_str)
+                debt = parse_rubles_kopeks(
+                    debt_match.group(1),
+                    debt_match.group(2)
+                )
+                if debt is not None:
+                    debt_has_kopeks = True
                     break
-                except ValueError:
-                    continue
 
-        if debt:
-            result['debt'] = f"{debt:,.0f}".replace(',', ' ')
+        if debt is None:
+            for pattern in debt_patterns:
+                debt_match = re.search(pattern, text, re.IGNORECASE)
+                if debt_match:
+                    debt_str = normalize_number(debt_match.group(1))
+                    try:
+                        debt = float(debt_str)
+                        if re.search(r'[.,]\d{1,2}', debt_match.group(1)):
+                            debt_has_kopeks = True
+                        break
+                    except ValueError:
+                        continue
+
+        if debt is not None:
+            if debt_has_kopeks:
+                result['debt'] = f"{debt:,.2f}".replace(',', ' ')
+            else:
+                result['debt'] = f"{debt:,.0f}".replace(',', ' ')
 
         # Извлекаем юридические услуги
         legal_patterns = [
@@ -848,11 +893,33 @@ class SlidingWindowParser:
             result['legal_contract_number'] = legal_contract_match.group(1)
             result['legal_contract_date'] = legal_contract_match.group(2)
 
+        payment_pattern = (
+            r'плат[её]жн[а-я]*\s+поручен[иея][^\n]*№\s*(\d+)'
+            r'\s*от\s*(\d{2}\.\d{2}\.\d{4})'
+        )
         payment_match = re.search(
-            r'плат[её]жн[а-я]*\s+поручен[иея][^\n]*№\s*(\d+)\s*от\s*(\d{2}\.\d{2}\.\d{4})',
+            rf'юридическ[^\n]{{0,200}}{payment_pattern}',
             text,
             re.IGNORECASE
         )
+        if not payment_match:
+            legal_block = re.search(
+                r'договор[^\n]{0,200}юридическ[^\n]*[\s\S]{0,400}',
+                text,
+                re.IGNORECASE
+            )
+            if legal_block:
+                payment_match = re.search(
+                    payment_pattern,
+                    legal_block.group(0),
+                    re.IGNORECASE
+                )
+        if not payment_match and not re.search(r'юридическ', text, re.IGNORECASE):
+            payment_match = re.search(
+                payment_pattern,
+                text,
+                re.IGNORECASE
+            )
         if payment_match:
             result['legal_payment_number'] = payment_match.group(1)
             result['legal_payment_date'] = payment_match.group(2)
@@ -1128,20 +1195,25 @@ class SlidingWindowParser:
         """
         Извлекает уникальные заявки и договоры-заявки, исключая дубликаты.
         """
+        number_pattern = (
+            r'([A-Za-zА-Яа-я0-9]+(?:[\s/\-–—][A-Za-zА-Яа-я0-9]+)*)'
+        )
+        date_pattern = r'(\d{2}\.\d{2}\.\d{4})'
         # Универсальный паттерн: ищет заявки в разных падежах и форматах
         patterns = [
             # Заявка на перевозку груза № 2910/2 от 29.10.2024 г.
-            r'(?:заявк[аи]? на перевозку груза|заявк[аи]? на перевозку|заявк[аи]? на транспортировку груза|заявк[аи]?|транспортн[а-яё]* заявк[аи]?)[^\n;\.]*№\s*(\d+(?:/\d+)?)[^\n;\.]*от\s*(\d{2}\.\d{2}\.\d{4})',
+            rf'(?:заявк[аи]? на перевозку груза|заявк[аи]? на перевозку|заявк[аи]? на транспортировку груза|заявк[аи]?|транспортн[а-яё]* заявк[аи]?)[^\n;\.]*№\s*{number_pattern}[^\n;\.]*от\s*{date_pattern}',
             # Договор-заявка на перевозку груза № 2910/2 от 29.10.2024 г.
-            r'(?:договор[\s-]*заявк[аи]?|договор[\s-]*заявк[аи]? на перевозку|договор[\s-]*заявк[аи]? на перевозку груза)[^\n;\.]*№\s*(\d+(?:/\d+)?)[^\n;\.]*от\s*(\d{2}\.\d{2}\.\d{4})',
+            rf'(?:договор[\s-]*заявк[аи]?|договор[\s-]*заявк[аи]? на перевозку|договор[\s-]*заявк[аи]? на перевозку груза)[^\n;\.]*№\s*{number_pattern}[^\n;\.]*от\s*{date_pattern}',
             # Приложение к договору-заявке № 2910/2 от 29.10.2024 г.
-            r'приложение[^\n;\.]*к[^\n;\.]*(?:договор[\s-]*заявк[аи]?|заявк[аи]?)[^\n;\.]*№\s*(\d+(?:/\d+)?)[^\n;\.]*от\s*(\d{2}\.\d{2}\.\d{4})',
+            rf'приложение[^\n;\.]*к[^\n;\.]*(?:договор[\s-]*заявк[аи]?|заявк[аи]?)[^\n;\.]*№\s*{number_pattern}[^\n;\.]*от\s*{date_pattern}',
         ]
 
         unique_applications = set()
         for pattern in patterns:
             matches = re.findall(pattern, text, re.IGNORECASE)
             for num, date in matches:
+                num = self._normalize_doc_number(num)
                 unique_applications.add(
                     f"Заявка на перевозку груза №{num} от {date} г.")
 
@@ -1153,28 +1225,33 @@ class SlidingWindowParser:
         """
         Извлекает уникальные УПД и акты, исключая дубликаты.
         """
+        number_pattern = (
+            r'([A-Za-zА-Яа-я0-9]+(?:[\s/\-–—][A-Za-zА-Яа-я0-9]+)*)'
+        )
+        date_pattern = r'(\d{2}\.\d{2}\.\d{4})'
         # Универсальный паттерн для УПД и актов в разных форматах
         patterns = [
             # УПД выполненных работ № 72 от 08.11.2025 г.
-            r'(?:УПД|универсальн[а-яё ]*передаточн[а-яё ]*документ[а-яё]*)[^\n;\.]*№\s*(\d+)[^\n;\.]*от\s*(\d{2}\.\d{2}\.\d{4})',
+            rf'(?:УПД|универсальн[а-яё ]*передаточн[а-яё ]*документ[а-яё]*)[^\n;\.]*№\s*{number_pattern}[^\n;\.]*от\s*{date_pattern}',
             # УПД № 72 от 08.11.2025 г.
-            r'УПД[^\n;\.]*№\s*(\d+)[^\n;\.]*от\s*(\d{2}\.\d{2}\.\d{4})',
+            rf'УПД[^\n;\.]*№\s*{number_pattern}[^\n;\.]*от\s*{date_pattern}',
             # Акт выполненных работ № 96 от 11.11.2024 г.
-            r'акт[а-яё]* выполненных работ[^\n;\.]*№\s*(\d+)[^\n;\.]*от\s*(\d{2}\.\d{2}\.\d{4})',
+            rf'\bакт[а-яё]* выполненных работ[^\n;\.]*№\s*{number_pattern}[^\n;\.]*от\s*{date_pattern}',
             # Акт оказанных услуг № 96 от 11.11.2024 г.
-            r'акт[а-яё]* оказанных услуг[^\n;\.]*№\s*(\d+)[^\n;\.]*от\s*(\d{2}\.\d{2}\.\d{4})',
+            rf'\bакт[а-яё]* оказанных услуг[^\n;\.]*№\s*{number_pattern}[^\n;\.]*от\s*{date_pattern}',
             # Акт сдачи-приемки услуг № 96 от 11.11.2024 г.
-            r'акт[а-яё]* сдачи[^\n;\.]*приемки[^\n;\.]*услуг[^\n;\.]*№\s*(\d+)[^\n;\.]*от\s*(\d{2}\.\d{2}\.\d{4})',
+            rf'\bакт[а-яё]* сдачи[^\n;\.]*приемки[^\n;\.]*услуг[^\n;\.]*№\s*{number_pattern}[^\n;\.]*от\s*{date_pattern}',
             # Акт сдачи-приемки выполненных работ № 96 от 11.11.2024 г.
-            r'акт[а-яё]* сдачи[^\n;\.]*приемки[^\n;\.]*выполненных работ[^\n;\.]*№\s*(\d+)[^\n;\.]*от\s*(\d{2}\.\d{2}\.\d{4})',
+            rf'\bакт[а-яё]* сдачи[^\n;\.]*приемки[^\n;\.]*выполненных работ[^\n;\.]*№\s*{number_pattern}[^\n;\.]*от\s*{date_pattern}',
             # Акт № 96 от 11.11.2024 г. (общий паттерн для актов)
-            r'акт[а-яё]*[^\n;\.]*№\s*(\d+)[^\n;\.]*от\s*(\d{2}\.\d{2}\.\d{4})',
+            rf'\bакт[а-яё]*[^\n;\.]*№\s*{number_pattern}[^\n;\.]*от\s*{date_pattern}',
         ]
 
         unique_upds = set()
         for pattern in patterns:
             matches = re.findall(pattern, text, re.IGNORECASE)
             for num, date in matches:
+                num = self._normalize_doc_number(num)
                 # Определяем тип документа по паттерну
                 if 'УПД' in pattern or 'универсальн' in pattern:
                     unique_upds.add(f"УПД №{num} от {date} г.")
@@ -1190,19 +1267,43 @@ class SlidingWindowParser:
         """
         Извлекает уникальные счета и счета-фактуры, исключая дубликаты.
         """
+        number_pattern = (
+            r'([A-Za-zА-Яа-я0-9]+(?:[\s/\-–—][A-Za-zА-Яа-я0-9]+)*)'
+        )
+        date_pattern = r'(\d{2}\.\d{2}\.\d{4})'
         # Универсальный паттерн для счетов в разных форматах
         patterns = [
-            # Счет на оплату № 81 от 31.10.2024 г.
-            r'(?:счет[а-яё]* на оплату|счет[а-яё]*|счет[а-яё]*[\s-]*фактур[а-яё]*)[^\n;\.]*№\s*(\d+)[^\n;\.]*от\s*(\d{2}\.\d{2}\.\d{4})',
-            # Счетом на оплату № 81 от 31.10.2024 г.
-            r'счет[а-яё]*[^\n;\.]*№\s*(\d+)[^\n;\.]*от\s*(\d{2}\.\d{2}\.\d{4})',
+            (
+                rf'счет[\s-]*фактур[а-яё]*[^\n;\.]*№\s*{number_pattern}'
+                rf'[^\n;\.]*от\s*{date_pattern}',
+                "Счет-фактура",
+            ),
+            (
+                rf'счет[а-яё]*\s+на\s+оплат[а-яё]*[^\n;\.]*№\s*{number_pattern}'
+                rf'[^\n;\.]*от\s*{date_pattern}',
+                "Счет на оплату",
+            ),
+            (
+                rf'счет(?![а-яё\s-]*фактур)[а-яё]*[^\n;\.]*№\s*{number_pattern}'
+                rf'[^\n;\.]*от\s*{date_pattern}',
+                "Счет на оплату",
+            ),
         ]
 
         unique_invoices = set()
-        for pattern in patterns:
+        seen = set()
+        for pattern, label in patterns:
             matches = re.findall(pattern, text, re.IGNORECASE)
             for num, date in matches:
-                unique_invoices.add(f"Счет на оплату №{num} от {date} г.")
+                num = self._normalize_doc_number(num)
+                key = (label, num, date)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if label == "Счет-фактура":
+                    unique_invoices.add(f"Счет-фактура №{num} от {date} г.")
+                else:
+                    unique_invoices.add(f"Счет на оплату №{num} от {date} г.")
 
         if unique_invoices:
             return '; '.join(sorted(unique_invoices))
@@ -1212,31 +1313,55 @@ class SlidingWindowParser:
         """
         Извлекает накладные и комплект сопроводительных документов.
         """
+        number_pattern = (
+            r'([A-Za-zА-Яа-я0-9]+(?:[\s/\-–—][A-Za-zА-Яа-я0-9]+)*)'
+        )
+        date_pattern = r'(\d{2}\.\d{2}\.\d{4})'
         patterns = [
             (
-                r'товарно[-\s]*транспортн[а-яё]*\s+накладн[а-яё]*[^\n;\.]*'
-                r'№\s*(\d+)[^\n;\.]*от\s*(\d{2}\.\d{2}\.\d{4})',
+                rf'товарно[-\s]*транспортн[а-яё]*\s+накладн[а-яё]*[^\n;\.]*'
+                rf'№\s*{number_pattern}[^\n;\.]*от\s*{date_pattern}',
                 'Товарно-транспортная накладная',
             ),
             (
-                r'транспортн[а-яё]*\s+накладн[а-яё]*[^\n;\.]*'
-                r'№\s*(\d+)[^\n;\.]*от\s*(\d{2}\.\d{2}\.\d{4})',
+                rf'транспортн[а-яё]*\s+накладн[а-яё]*[^\n;\.]*'
+                rf'№\s*{number_pattern}[^\n;\.]*от\s*{date_pattern}',
                 'Транспортная накладная',
             ),
             (
-                r'товарн[а-яё]*\s+накладн[а-яё]*[^\n;\.]*'
-                r'№\s*(\d+)[^\n;\.]*от\s*(\d{2}\.\d{2}\.\d{4})',
+                rf'товарн[а-яё]*\s+накладн[а-яё]*[^\n;\.]*'
+                rf'№\s*{number_pattern}[^\n;\.]*от\s*{date_pattern}',
                 'Товарная накладная',
+            ),
+            (
+                rf'накладн[а-яё]*\s+на\s+внутренн[а-яё]*\s+перемещен[а-яё]*'
+                rf'[^\n;\.]*№\s*{number_pattern}[^\n;\.]*от\s*{date_pattern}',
+                'Накладная на внутреннее перемещение, передачу товара, тары',
+            ),
+            (
+                rf'реестр\s+документ[а-яё]*[^\n;\.]*№\s*{number_pattern}'
+                rf'[^\n;\.]*?(?:от|№)\s*{date_pattern}',
+                'Реестр документов',
             ),
         ]
 
         unique_docs = set()
         seen_pairs = set()
+        overlap_labels = {
+            'Товарно-транспортная накладная',
+            'Транспортная накладная',
+            'Товарная накладная',
+        }
 
         for pattern, label in patterns:
             matches = re.findall(pattern, text, re.IGNORECASE)
             for num, date in matches:
-                key = (num, date)
+                num = self._normalize_doc_number(num)
+                date = date.strip() if date else date
+                if label in overlap_labels:
+                    key = ('overlap', num, date)
+                else:
+                    key = (label, num, date)
                 if key in seen_pairs:
                     continue
                 seen_pairs.add(key)
