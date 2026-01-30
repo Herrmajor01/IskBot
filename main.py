@@ -9,7 +9,8 @@ import os
 import re
 import shutil
 import uuid
-from datetime import datetime, timedelta
+from collections import Counter
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Set, Tuple
 from xml.etree import ElementTree as ET
@@ -418,11 +419,14 @@ def insert_pretension_interest_table(
             rate = row.get('rate', 0.0)
             rate_text = f"{rate:.2f}".replace('.', ',') + "%"
             interest_text = format_money(row.get('interest', 0.0), 2).replace('.', ',')
-            cells[0].text = format_money(row.get('sum', 0.0), 0)
+            cells[0].text = format_money(row.get('sum', 0.0), 2).replace('.', ',')
             cells[1].text = f"{date_from} г." if date_from else ''
             cells[2].text = f"{date_to} г." if date_to else ''
             cells[3].text = str(row.get('days', ''))
-            cells[4].text = format_money(increase_sum, 0) if increase_sum else '0'
+            cells[4].text = (
+                format_money(increase_sum, 2).replace('.', ',')
+                if increase_sum else '0'
+            )
             cells[5].text = increase_date or '-'
             cells[6].text = rate_text
             cells[7].text = str(row.get('year_days', ''))
@@ -1245,6 +1249,100 @@ def parse_prepayment_terms_details(
     return prepay_amount, prepay_days, prepay_base, remainder_days
 
 
+def parse_percent_near_keywords(
+    text: str,
+    keywords: List[str]
+) -> Optional[float]:
+    if not text:
+        return None
+    lowered = text.lower()
+    if not any(keyword in lowered for keyword in keywords):
+        return None
+    pattern = re.compile(
+        r'(' + "|".join(re.escape(k) for k in keywords) + r')[^\d%]{0,40}'
+        r'(\d{1,3}(?:[.,]\d{1,2})?)\s*%',
+        re.IGNORECASE
+    )
+    match = pattern.search(text)
+    if match:
+        value = parse_amount(match.group(2))
+        if 0 < value <= 100:
+            return float(value)
+    return None
+
+
+def extract_payment_parts_from_terms(
+    terms_text: str
+) -> List[Dict[str, Any]]:
+    if not terms_text:
+        return []
+    text = terms_text
+    lower = text.lower()
+
+    prepay_amount, prepay_days, prepay_base, remainder_days = parse_prepayment_terms_details(text)
+    prepay_percent = parse_percent_near_keywords(text, ["предоплат", "аванс"])
+    remainder_percent = parse_percent_near_keywords(text, ["остаток"])
+
+    parts: List[Dict[str, Any]] = []
+
+    has_split_hint = any(
+        token in lower for token in ("предоплат", "аванс", "остаток", "част")
+    )
+
+    if prepay_amount > 0 or prepay_percent or has_split_hint:
+        if prepay_amount > 0 or prepay_percent:
+            parts.append({
+                "size_type": "fixed" if prepay_amount > 0 else "percent",
+                "size_value": prepay_amount if prepay_amount > 0 else prepay_percent,
+                "anchor": prepay_base or "load",
+                "days": prepay_days if prepay_days else None,
+            })
+
+        remainder_anchor = None
+        if "получен" in lower and "документ" in lower:
+            remainder_anchor = "receive_docs"
+        elif "разгруз" in lower or "выгруз" in lower:
+            remainder_anchor = "unload"
+        elif "погруз" in lower:
+            remainder_anchor = "load"
+
+        parts.append({
+            "size_type": "percent" if remainder_percent else "remainder",
+            "size_value": remainder_percent,
+            "anchor": remainder_anchor or "receive_docs",
+            "days": remainder_days if remainder_days else None,
+        })
+        return parts
+
+    days_match = re.search(
+        r'(\d+)\s+рабоч\w*\s+дн\w*',
+        text,
+        re.IGNORECASE
+    )
+    if days_match:
+        try:
+            days_value = int(days_match.group(1))
+        except ValueError:
+            days_value = None
+        if "получен" in lower:
+            anchor = "receive_docs"
+        elif "разгруз" in lower or "выгруз" in lower:
+            anchor = "unload"
+        elif "погруз" in lower:
+            anchor = "load"
+        else:
+            anchor = "receive_docs"
+        if days_value:
+            parts.append({
+                "size_type": "percent",
+                "size_value": 100.0,
+                "anchor": anchor,
+                "days": days_value,
+            })
+
+    return parts
+
+
 def build_prepayment_terms_text(
     prepay_amount: float,
     prepay_days: int,
@@ -1655,7 +1753,9 @@ def generate_payment_terms(claim_data: dict) -> str:
 def parse_date_str(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
-    match = re.search(r'\d{2}\.\d{2}\.\d{4}', str(value))
+    cleaned = str(value)
+    cleaned = cleaned.replace("О", "0").replace("о", "0").replace("O", "0")
+    match = re.search(r'\d{2}\.\d{2}\.\d{4}', cleaned)
     if not match:
         return None
     try:
@@ -1715,6 +1815,138 @@ WORK_CALENDAR_CACHE = os.path.join(
     os.path.dirname(__file__),
     "work_calendar_cache.json"
 )
+WORK_CALENDAR_API_BASE = os.getenv(
+    "WORK_CALENDAR_API_BASE",
+    "https://calendar.kuzyak.in/api"
+)
+VISION_OCR_CACHE = os.path.join(
+    os.path.dirname(__file__),
+    "vision_ocr_cache.json"
+)
+
+
+def _parse_iso_date(value: Optional[str]) -> Optional[datetime.date]:
+    if not value:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    raw = raw.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(raw).date()
+    except ValueError:
+        match = re.match(r"(\\d{4})-(\\d{2})-(\\d{2})", raw)
+        if not match:
+            return None
+        year, month, day = match.groups()
+        try:
+            return datetime(int(year), int(month), int(day)).date()
+        except ValueError:
+            return None
+
+
+def fetch_calendar_holidays(year: int) -> Dict[datetime.date, bool]:
+    url = f"{WORK_CALENDAR_API_BASE}/calendar/{year}/holidays"
+    response = requests.get(url, timeout=15)
+    response.raise_for_status()
+    payload = response.json() if response.content else {}
+    holidays = payload.get("holidays") if isinstance(payload, dict) else None
+    result: Dict[datetime.date, bool] = {}
+    if isinstance(holidays, list):
+        for item in holidays:
+            if isinstance(item, dict):
+                date_str = item.get("date")
+            else:
+                date_str = str(item)
+            date_obj = _parse_iso_date(date_str) or _coerce_date(date_str)
+            if date_obj:
+                result[date_obj.date() if isinstance(date_obj, datetime) else date_obj] = False
+    return result
+
+
+def fetch_calendar_day_status(date_obj: datetime.date) -> Optional[bool]:
+    url = (
+        f"{WORK_CALENDAR_API_BASE}/calendar/"
+        f"{date_obj.year}/{date_obj.month:02d}/{date_obj.day:02d}"
+    )
+    response = requests.get(url, timeout=10)
+    response.raise_for_status()
+    payload = response.json() if response.content else {}
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("status") not in (None, 200):
+        return None
+    is_working = bool(payload.get("isWorkingDay"))
+    is_short = bool(payload.get("isShortDay"))
+    return is_working or is_short
+
+
+class CalendarLookup(dict):
+    def __init__(
+        self,
+        year: int,
+        initial: Optional[Dict[datetime.date, bool]] = None,
+        cache_path: Optional[str] = None
+    ) -> None:
+        super().__init__(initial or {})
+        self._year = year
+        self._cache_path = cache_path
+        verify_raw = os.getenv("WORK_CALENDAR_VERIFY", "1").lower()
+        self._verify = verify_raw in ("1", "true", "yes", "on")
+        self._validated: Set[datetime.date] = set()
+
+    def get(self, key, default=None):
+        if isinstance(key, datetime):
+            key = key.date()
+        if not isinstance(key, date):
+            return default
+        if key.year != self._year:
+            other = load_work_calendar(key.year)
+            return other.get(key, default) if other is not None else default
+        if key in self:
+            if not self._verify or key in self._validated:
+                return super().get(key, default)
+            try:
+                status = fetch_calendar_day_status(key)
+            except Exception as exc:
+                logging.warning("Не удалось получить статус дня %s: %s", key, exc)
+                self._validated.add(key)
+                return super().get(key, default)
+            if status is None:
+                self._validated.add(key)
+                return super().get(key, default)
+            super().__setitem__(key, bool(status))
+            self._persist()
+            self._validated.add(key)
+            return bool(status)
+        try:
+            status = fetch_calendar_day_status(key)
+        except Exception as exc:
+            logging.warning("Не удалось получить статус дня %s: %s", key, exc)
+            return default
+        if status is None:
+            return default
+        super().__setitem__(key, bool(status))
+        self._persist()
+        self._validated.add(key)
+        return bool(status)
+
+    def _persist(self) -> None:
+        if not self._cache_path:
+            return
+        try:
+            payload: Dict[str, Any] = {}
+            if os.path.exists(self._cache_path):
+                with open(self._cache_path, "r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+            payload[str(self._year)] = {
+                date_obj.strftime("%Y-%m-%d"): int(is_working)
+                for date_obj, is_working in self.items()
+            }
+            with open(self._cache_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            logging.warning("Ошибка сохранения календаря рабочих дней: %s", exc)
 
 
 def _parse_ru_month(value: str) -> Optional[int]:
@@ -1751,6 +1983,7 @@ def _parse_ru_month(value: str) -> Optional[int]:
 
 
 def fetch_work_calendar(year: int) -> Dict[datetime.date, bool]:
+    """Fallback: parse work calendar from HTML if API is unavailable."""
     url = (
         f"https://calendar.yoip.ru/work/{year}-proizvodstvennyj-calendar.html"
     )
@@ -1784,62 +2017,97 @@ def fetch_work_calendar(year: int) -> Dict[datetime.date, bool]:
 
 
 def load_work_calendar(year: int) -> Dict[datetime.date, bool]:
+    cached: Dict[datetime.date, bool] = {}
     try:
         if os.path.exists(WORK_CALENDAR_CACHE):
             with open(WORK_CALENDAR_CACHE, "r", encoding="utf-8") as handle:
                 payload = json.load(handle)
             if isinstance(payload, dict) and str(year) in payload:
-                cached = payload[str(year)]
-                if isinstance(cached, dict):
-                    result = {}
-                    for key, value in cached.items():
+                raw = payload[str(year)]
+                if isinstance(raw, dict):
+                    for key, value in raw.items():
                         try:
                             date_obj = datetime.strptime(
                                 key, "%Y-%m-%d"
                             ).date()
                         except ValueError:
                             continue
-                        result[date_obj] = bool(value)
-                    if result:
-                        return result
+                        cached[date_obj] = bool(value)
     except Exception as exc:
         logging.warning("Ошибка чтения календаря рабочих дней: %s", exc)
 
-    try:
-        calendar = fetch_work_calendar(year)
-    except Exception as exc:
-        logging.warning(
-            "Не удалось загрузить производственный календарь: %s",
-            exc
-        )
-        return {}
+    calendar = CalendarLookup(year, cached, WORK_CALENDAR_CACHE)
 
-    try:
-        payload = {}
-        if os.path.exists(WORK_CALENDAR_CACHE):
-            with open(WORK_CALENDAR_CACHE, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-        payload[str(year)] = {
-            date_obj.strftime("%Y-%m-%d"): int(is_working)
-            for date_obj, is_working in calendar.items()
-        }
-        with open(WORK_CALENDAR_CACHE, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2)
-    except Exception as exc:
-        logging.warning(
-            "Ошибка сохранения календаря рабочих дней: %s",
-            exc
-        )
+    if not cached:
+        try:
+            holidays = fetch_calendar_holidays(year)
+            if holidays:
+                calendar.update(holidays)
+                calendar._persist()
+        except Exception as exc:
+            logging.warning(
+                "Не удалось загрузить производственный календарь: %s",
+                exc
+            )
+            try:
+                fallback = fetch_work_calendar(year)
+                if fallback:
+                    calendar.update(fallback)
+                    calendar._persist()
+            except Exception:
+                return calendar
 
     return calendar
 
 
 def is_working_day(value: datetime, calendar: Dict[datetime.date, bool]) -> bool:
-    if calendar:
+    strict_raw = os.getenv("STRICT_WORK_CALENDAR", "1").lower()
+    strict = strict_raw in ("1", "true", "yes", "on")
+    if calendar is None:
+        calendar = load_work_calendar(value.year)
+    if calendar is not None:
         lookup = calendar.get(value.date())
         if lookup is not None:
             return lookup
+    if strict:
+        raise RuntimeError(
+            f"Не удалось определить рабочий день по производственному календарю: "
+            f"{value.strftime('%d.%m.%Y')}"
+        )
     return value.weekday() < 5
+
+
+def prefetch_work_calendar_range(
+    start_date: Optional[datetime],
+    end_date: Optional[datetime]
+) -> None:
+    if not start_date or not end_date:
+        return
+    start = start_date.date() if isinstance(start_date, datetime) else start_date
+    end = end_date.date() if isinstance(end_date, datetime) else end_date
+    if start > end:
+        start, end = end, start
+    total_days = (end - start).days
+    limit_raw = os.getenv("WORK_CALENDAR_PREFETCH_LIMIT", "0").strip()
+    try:
+        limit = int(limit_raw)
+    except ValueError:
+        limit = 0
+    if limit > 0 and total_days > limit:
+        logging.warning(
+            "Диапазон календаря слишком большой (%s дней), "
+            "ограничиваю до %s дней.",
+            total_days,
+            limit
+        )
+        end = start + timedelta(days=limit)
+    current = start
+    calendar = load_work_calendar(current.year)
+    while current <= end:
+        if current.year != getattr(calendar, "_year", current.year):
+            calendar = load_work_calendar(current.year)
+        calendar.get(current)
+        current += timedelta(days=1)
 
 
 def add_working_days(
@@ -1849,6 +2117,11 @@ def add_working_days(
 ) -> datetime:
     if days <= 0:
         return start_date
+    buffer_days = max(14, int(days * 0.7))
+    prefetch_work_calendar_range(
+        start_date,
+        start_date + timedelta(days=days + buffer_days)
+    )
     current = start_date
     added = 0
     while added < days:
@@ -1958,6 +2231,12 @@ def apply_vision_ocr_to_pages(
     pages: List[str],
     low_text_pages: List[int]
 ) -> List[int]:
+    def log_progress(message: str) -> None:
+        flag = os.getenv("VISION_PROGRESS_LOG", "1").lower()
+        if flag in ("1", "true", "yes", "on"):
+            stamp = datetime.now().strftime("%H:%M:%S")
+            print(f"[{stamp}] {message}", flush=True)
+
     config = get_vision_config()
     if not config.get("enabled") or not low_text_pages:
         return []
@@ -1966,25 +2245,80 @@ def apply_vision_ocr_to_pages(
     target_pages = (
         low_text_pages[:max_pages] if max_pages > 0 else low_text_pages
     )
+    cache_enabled = os.getenv("VISION_OCR_CACHE_ENABLED", "1").lower() not in ("0", "false", "no")
+    cache = _load_vision_ocr_cache() if cache_enabled else {}
+    cache_signature = _get_file_signature(file_path) if cache_enabled else None
+    cache_bucket = None
+    if cache_enabled and cache_signature:
+        cache_bucket = cache.setdefault("files", {}).setdefault(cache_signature, {"pages": {}})
+        if isinstance(cache_bucket, dict):
+            cache_bucket.setdefault("path", os.path.basename(file_path))
+            cache_bucket.setdefault("pages", {})
+
+    processed: List[int] = []
+    pages_to_ocr: List[int] = []
+    for page_number in target_pages:
+        existing = pages[page_number - 1] if page_number - 1 < len(pages) else ""
+        if _page_text_seems_sufficient(existing, file_path):
+            log_progress(
+                f"Vision OCR skip (sufficient text) стр. {page_number} "
+                f"{os.path.basename(file_path)}"
+            )
+            continue
+
+        cached_text = None
+        if cache_bucket and isinstance(cache_bucket.get("pages"), dict):
+            cached_text = cache_bucket["pages"].get(str(page_number))
+        if cached_text:
+            log_progress(
+                f"Vision OCR cache hit стр. {page_number} "
+                f"{os.path.basename(file_path)}"
+            )
+            combined = cached_text.strip()
+            if existing and existing.strip() not in combined:
+                combined = f"{existing.strip()}\n{combined}"
+            pages[page_number - 1] = combined
+            processed.append(page_number)
+            continue
+        pages_to_ocr.append(page_number)
+
+    if not pages_to_ocr:
+        if cache_enabled and cache_signature:
+            _save_vision_ocr_cache(cache)
+        return processed
+
+    log_progress(
+        f"Vision OCR: {os.path.basename(file_path)} pages "
+        f"{len(pages_to_ocr)}"
+    )
     image_paths = render_pdf_pages(
         file_path,
-        target_pages,
-        max_pages=len(target_pages)
+        pages_to_ocr,
+        max_pages=len(pages_to_ocr)
     )
-    processed: List[int] = []
-    for page_number, image_path in zip(target_pages, image_paths):
+    total = len(pages_to_ocr)
+    for index, (page_number, image_path) in enumerate(zip(pages_to_ocr, image_paths), start=1):
+        existing = pages[page_number - 1] if page_number - 1 < len(pages) else ""
+
+        log_progress(
+            f"Vision OCR page {index}/{total} "
+            f"(стр. {page_number}) {os.path.basename(file_path)}"
+        )
         vision_text = extract_text_from_image_llm(image_path)
         if vision_text:
-            existing = pages[page_number - 1] if page_number - 1 < len(pages) else ""
             combined = vision_text.strip()
             if existing and existing.strip() not in combined:
                 combined = f"{existing.strip()}\n{combined}"
             pages[page_number - 1] = combined
             processed.append(page_number)
+            if cache_bucket and isinstance(cache_bucket.get("pages"), dict):
+                cache_bucket["pages"][str(page_number)] = vision_text
         try:
             os.remove(image_path)
         except OSError:
             pass
+    if cache_enabled and cache_signature:
+        _save_vision_ocr_cache(cache)
     return processed
 
 
@@ -2070,7 +2404,7 @@ def collect_targeted_ocr_pages(
     candidates.extend(find_keyword_candidate_pages(
         pages,
         ("упд", "передаточн"),
-        limit=1
+        limit=4
     ))
     candidates.extend(find_keyword_candidate_pages(
         pages,
@@ -2274,11 +2608,22 @@ def apply_vision_document_extraction(
     pages: List[str],
     page_numbers: List[int]
 ) -> List[int]:
+    def log_progress(message: str) -> None:
+        flag = os.getenv("VISION_PROGRESS_LOG", "1").lower()
+        if flag in ("1", "true", "yes", "on"):
+            stamp = datetime.now().strftime("%H:%M:%S")
+            print(f"[{stamp}] {message}", flush=True)
+
     processed: List[int] = []
-    for page_num in page_numbers:
+    total = len(page_numbers)
+    for index, page_num in enumerate(page_numbers, start=1):
         page_idx = page_num - 1
         if page_idx < 0 or page_idx >= len(pages):
             continue
+        log_progress(
+            f"Vision doc-scan page {index}/{total} "
+            f"(стр. {page_num}) {os.path.basename(file_path)}"
+        )
         vision_data = extract_claim_document_with_vision(
             file_path,
             page_idx
@@ -2407,6 +2752,75 @@ def extract_line_value(text: str, labels: List[str]) -> Optional[str]:
     return None
 
 
+def _get_file_signature(file_path: str) -> Optional[str]:
+    try:
+        stat = os.stat(file_path)
+        return (
+            f"{os.path.basename(file_path)}:"
+            f"{stat.st_size}:{int(stat.st_mtime)}"
+        )
+    except OSError:
+        return None
+
+
+def _load_vision_ocr_cache() -> Dict[str, Any]:
+    try:
+        if os.path.exists(VISION_OCR_CACHE):
+            with open(VISION_OCR_CACHE, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if isinstance(payload, dict):
+                return payload
+    except Exception as exc:
+        logging.warning("Ошибка чтения кэша OCR: %s", exc)
+    return {}
+
+
+def _save_vision_ocr_cache(cache: Dict[str, Any]) -> None:
+    try:
+        with open(VISION_OCR_CACHE, "w", encoding="utf-8") as handle:
+            json.dump(cache, handle, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        logging.warning("Ошибка сохранения кэша OCR: %s", exc)
+
+
+def _page_text_seems_sufficient(text: str, file_path: str) -> bool:
+    if not text:
+        return False
+    compact = re.sub(r'\s+', ' ', text).strip()
+    if len(compact) < 140:
+        return False
+    lower = compact.lower()
+    file_lower = os.path.basename(file_path).lower()
+
+    if "упд" in file_lower or "upd" in file_lower:
+        keywords = ("упд", "счет-фактур", "передаточн")
+    elif "счет" in file_lower or "счёт" in file_lower:
+        keywords = ("счет", "счёт", "к оплате", "покупател", "поставщик")
+    elif "заявк" in file_lower:
+        keywords = ("заявк", "реквизит", "перевозчик", "экспедитор", "погрузк", "разгрузк")
+    elif "сопровод" in file_lower or "наклад" in file_lower:
+        keywords = ("накладн", "транспортн", "ттн", "груз", "водител", "экспедиторск")
+    elif "чек" in file_lower or "почт" in file_lower or "отправ" in file_lower:
+        keywords = ("квитанц", "рпо", "отслеж", "почт", "отправлен")
+    else:
+        keywords = ("договор", "акт", "услуг", "счет", "счёт")
+
+    if keywords and not any(token in lower for token in keywords):
+        return False
+
+    has_date = bool(re.search(r'\d{2}[./]\d{2}[./]\d{4}', compact))
+    has_money = bool(
+        re.search(r'\d[\d\s]{2,}[.,]\d{2}', compact)
+        or re.search(r'\d[\d\s]{3,}\s*руб', compact, re.IGNORECASE)
+    )
+
+    if len(compact) >= 300 and (has_date or has_money):
+        return True
+    if len(compact) >= 600 and (has_date or has_money):
+        return True
+    return False
+
+
 def extract_date_near_labels(text: str, labels: List[str]) -> Optional[datetime]:
     for label in labels:
         label_pattern = _build_label_pattern(label)
@@ -2456,6 +2870,240 @@ def extract_application_number_from_text(text: str) -> Optional[str]:
     if len(matches) == 1:
         return matches[0].strip()
     return None
+
+
+def extract_application_number_candidates(text: str) -> List[str]:
+    if not text:
+        return []
+    matches = re.findall(
+        r'Заявк[аеи]?\s*№\s*([A-Za-zА-Яа-я0-9/:\\-]+)',
+        text,
+        re.IGNORECASE
+    )
+    return [match.strip() for match in matches if match.strip()]
+
+
+def normalize_application_reference(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    cleaned = re.sub(r'\s+', '', str(value))
+    cleaned = cleaned.replace(":", "/").replace("\\", "/")
+    cleaned = re.sub(r'[^A-Za-zА-Яа-я0-9/\\-]', '', cleaned)
+    return cleaned.upper()
+
+
+def _extract_flexible_date_str(text: str) -> Optional[str]:
+    if not text:
+        return None
+    text = str(text).replace("\xa0", " ")
+    match = re.search(r'(\d{2})[.\\s](\d{2})[.\\s](\d{4})', text)
+    if not match:
+        match = re.search(r'(\d{2})[./](\d{2})[./](\d{4})', text)
+    if not match:
+        return None
+    return f"{match.group(1)}.{match.group(2)}.{match.group(3)}"
+
+
+def extract_downtime_pretension_from_text(
+    text: str,
+    source_name: str = ""
+) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    lowered = text.lower()
+    if "претенз" not in lowered:
+        return None
+    if not re.search(r'просто[йяе]', lowered):
+        return None
+
+    info: Dict[str, Any] = {"source_file": source_name}
+
+    pretension_match = re.search(
+        r'претензия\s*№\s*([A-Za-zА-Яа-я0-9/\\-]+).*?от\s*([0-9.\\s]{8,12})',
+        text,
+        re.IGNORECASE | re.DOTALL
+    )
+    if pretension_match:
+        info["pretension_number"] = pretension_match.group(1).strip()
+        info["pretension_date"] = _extract_flexible_date_str(
+            pretension_match.group(2)
+        )
+
+    app_number = ""
+    app_date = None
+    app_matches = extract_application_number_candidates(text)
+    if app_matches:
+        app_number = app_matches[0]
+    if not app_number and source_name:
+        name_match = re.search(
+            r'заявк[аеи]?\s*№\s*([A-Za-zА-Яа-я0-9/:\\-]+)',
+            source_name,
+            re.IGNORECASE
+        )
+        if name_match:
+            app_number = name_match.group(1)
+    app_number = normalize_application_reference(app_number)
+    app_date_match = re.search(
+        r'заявк[аеи]?\s*№\s*[A-Za-zА-Яа-я0-9/:\\-]+\s*от\s*([0-9.\\s]{8,12})',
+        text,
+        re.IGNORECASE
+    )
+    if app_date_match:
+        app_date = _extract_flexible_date_str(app_date_match.group(1))
+    if app_number:
+        info["application_number"] = app_number
+        if app_date:
+            info["application_date"] = app_date
+        info["application_label"] = (
+            f"Заявка № {app_number} от {app_date}"
+            if app_date else f"Заявка № {app_number}"
+        )
+
+    amount = None
+    amount_match = re.search(
+        r'составля[её]т\s+([\d\s]+)\s*\(?[^\\n]{0,20}руб',
+        text,
+        re.IGNORECASE
+    )
+    if amount_match:
+        amount = parse_amount(amount_match.group(1))
+    if amount is None:
+        amount_match = re.search(
+            r'размер\s+просто[яй]\s+.*?([\d\s]+)\s*\(?[^\\n]{0,20}руб',
+            text,
+            re.IGNORECASE
+        )
+        if amount_match:
+            amount = parse_amount(amount_match.group(1))
+    if amount is None:
+        amount = extract_last_amount_from_text(text)
+
+    hours = None
+    hours_match = re.search(
+        r'за\s*(\d{1,3})\s*час',
+        text,
+        re.IGNORECASE
+    )
+    if hours_match:
+        try:
+            hours = int(hours_match.group(1))
+        except ValueError:
+            hours = None
+
+    rate = None
+    rate_match = re.search(
+        r'(\d[\d\s]{0,10})\s*(?:\\([^\\)]*\\))?\s*руб[^\\n]{0,40}в\s*час',
+        text,
+        re.IGNORECASE
+    )
+    if rate_match:
+        rate = parse_amount(rate_match.group(1))
+    if rate is None and amount and hours:
+        try:
+            rate = float(amount) / float(hours)
+        except (TypeError, ZeroDivisionError, ValueError):
+            rate = None
+
+    if amount is None and hours and rate:
+        amount = hours * rate
+
+    if amount:
+        info["amount"] = float(amount)
+    if hours:
+        info["hours"] = hours
+    if rate:
+        info["rate"] = float(rate)
+
+    payment_days = None
+    payment_type = None
+    payment_match = re.search(
+        r'в\s*течени[еи]\s*(\d{1,2})\s*\(?[^\\n]{0,20}?(банковск|рабоч)',
+        text,
+        re.IGNORECASE
+    )
+    if payment_match:
+        payment_days = int(payment_match.group(1))
+        payment_type = "banking" if "банков" in payment_match.group(2).lower() else "working"
+    if payment_days:
+        info["payment_days"] = payment_days
+        info["payment_days_type"] = payment_type
+
+    attachments: List[str] = []
+    for match in re.finditer(
+        r'(сч[её]т\s+на\s+оплату)\s*№\s*([A-Za-zА-Яа-я0-9/\\-]+)\s*от\s*([0-9.\\s]{8,12})',
+        text,
+        re.IGNORECASE
+    ):
+        date_str = _extract_flexible_date_str(match.group(3))
+        label = f"Счет на оплату № {match.group(2)}"
+        if date_str:
+            label += f" от {date_str}"
+        attachments.append(label)
+
+    for match in re.finditer(
+        r'(акт\s+выполненных\s+работ)\s*№\s*([A-Za-zА-Яа-я0-9/\\-]+)\s*от\s*([0-9.\\s]{8,12})',
+        text,
+        re.IGNORECASE
+    ):
+        date_str = _extract_flexible_date_str(match.group(3))
+        label = f"Акт выполненных работ № {match.group(2)}"
+        if date_str:
+            label += f" от {date_str}"
+        attachments.append(label)
+
+    if not attachments:
+        for line in text.splitlines():
+            lowered_line = line.lower()
+            if "счет на оплату" in lowered_line or "счёт на оплату" in lowered_line:
+                number_match = re.search(r'№\s*([A-Za-zА-Яа-я0-9/\\-]+)', line)
+                date_match = _extract_flexible_date_str(line)
+                label = "Счет на оплату"
+                if number_match:
+                    label += f" № {number_match.group(1)}"
+                if date_match:
+                    label += f" от {date_match}"
+                attachments.append(label)
+            if "акт выполненных работ" in lowered_line:
+                number_match = re.search(r'№\s*([A-Za-zА-Яа-я0-9/\\-]+)', line)
+                date_match = _extract_flexible_date_str(line)
+                label = "Акт выполненных работ"
+                if number_match:
+                    label += f" № {number_match.group(1)}"
+                if date_match:
+                    label += f" от {date_match}"
+                attachments.append(label)
+
+    if attachments:
+        info["attachments"] = attachments
+
+    claimant_name = ""
+    claimant_inn = ""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for idx, line in enumerate(lines):
+        if re.search(r'получател', line, re.IGNORECASE):
+            line_value = line.split(":", 1)[1].strip() if ":" in line else line
+            candidate_name = re.split(
+                r'\bИНН\b|,',
+                line_value,
+                1,
+                flags=re.IGNORECASE
+            )[0].strip()
+            if candidate_name:
+                claimant_name = normalize_company_name(candidate_name)
+            window = "\n".join(lines[idx:idx + 5])
+            inn_match = re.search(r'\bИНН\s*[:\s]*(\d{10,12})', window, re.IGNORECASE)
+            if inn_match:
+                claimant_inn = inn_match.group(1)
+            if claimant_name or claimant_inn:
+                break
+    if claimant_name:
+        info["claimant_name"] = claimant_name
+    if claimant_inn:
+        info["claimant_inn"] = claimant_inn
+
+    if not any(info.get(key) for key in ("amount", "hours", "rate")):
+        return None
+    return info
 
 
 def normalize_application_number(value: Optional[str]) -> str:
@@ -2778,16 +3426,26 @@ def extract_application_amount(text: str) -> Optional[float]:
             token in lower for token in ("услуг", "перевоз", "фрахт", "тариф")
         ):
             value = find_amount(line)
-            if not value and idx + 1 < len(lines):
-                value = find_amount(lines[idx + 1])
+            if not value:
+                for offset in range(1, 4):
+                    if idx + offset >= len(lines):
+                        break
+                    value = find_amount(lines[idx + offset])
+                    if value:
+                        break
             if value:
                 return value
         if "цена" in lower and any(
             token in lower for token in ("услуг", "перевоз", "фрахт")
         ):
             value = find_amount(line)
-            if not value and idx + 1 < len(lines):
-                value = find_amount(lines[idx + 1])
+            if not value:
+                for offset in range(1, 4):
+                    if idx + offset >= len(lines):
+                        break
+                    value = find_amount(lines[idx + offset])
+                    if value:
+                        break
             if value:
                 return value
 
@@ -2800,6 +3458,19 @@ def extract_application_amount(text: str) -> Optional[float]:
         if value >= 1000:
             return value
 
+    return None
+
+
+def extract_vat_policy(text: str) -> Optional[str]:
+    if not text:
+        return None
+    lower = text.lower()
+    has_without = bool(re.search(r"без\s+(?:учет[ауы]\s+)?ндс", lower))
+    has_with = bool(re.search(r"(?:с|включа[ея]я)\s+ндс", lower))
+    if has_without and not has_with:
+        return "without_vat"
+    if has_with and not has_without:
+        return "with_vat"
     return None
 
 
@@ -2930,6 +3601,9 @@ def extract_applications_from_pages(
         amount_value = extract_application_amount(combined_text)
         if amount_value:
             app["amount"] = amount_value
+        vat_policy = extract_vat_policy(combined_text)
+        if vat_policy:
+            app["vat_policy"] = vat_policy
         if page_details:
             app.update(page_details)
         applications.append(app)
@@ -2976,6 +3650,7 @@ def extract_invoices_from_pages(pages: List[str]) -> List[Dict[str, Any]]:
         if key in seen:
             continue
         seen.add(key)
+        details = extract_transport_details(page, allow_llm=False)
         amount_value = None
         for amount_pattern in amount_patterns:
             amount_matches = amount_pattern.findall(page)
@@ -2987,12 +3662,15 @@ def extract_invoices_from_pages(pages: List[str]) -> List[Dict[str, Any]]:
                     break
             if amount_value:
                 break
-        invoices.append({
+        invoice_entry = {
             "number": number,
             "date": parse_date_str(date_str),
             "label": f"Счет № {number} от {date_str}",
             "amount": amount_value,
-        })
+        }
+        if details:
+            invoice_entry.update(details)
+        invoices.append(invoice_entry)
     return invoices
 
 
@@ -3000,56 +3678,92 @@ def extract_upd_from_pages(pages: List[str]) -> List[Dict[str, Any]]:
     upd_docs = []
     seen = set()
     pattern = re.compile(
-        r'(?:УПД|универсальн[^\n]*передаточн[^\n]*документ)'
+        r'(?:УПД|универсальн[^\n]*передаточн[^\n]*документ|счет-?фактур[аы])'
         r'[^\n]*?№\s*([A-Za-zА-Яа-я0-9/\\-]+)'
         r'[^\n]*?от\s*([^\n]+)',
         re.IGNORECASE
     )
     amount_patterns = [
         re.compile(
-            r'(?:Итого\s+к\s+оплате|Всего\s+к\s+оплате)\s*'
-            r'([\s\S]{0,60})',
+            r'(?:Итого|Всего)\s+к\s+оплате\s*([\s\S]{0,120})',
             re.IGNORECASE
         ),
         re.compile(
-            r'на\s+сумм[ау]\s*([\s\S]{0,60})',
+            r'стоимость[^\n]{0,80}с\s+налогом[^\n]{0,80}([\s\S]{0,120})',
             re.IGNORECASE
         ),
         re.compile(
-            r'сумм[ау]\s*([\s\S]{0,60})\s*руб',
+            r'всего\s+с\s+налогом[^\d]{0,40}([\s\S]{0,120})',
+            re.IGNORECASE
+        ),
+        re.compile(
+            r'на\s+сумм[ау]\s*([\s\S]{0,80})',
+            re.IGNORECASE
+        ),
+        re.compile(
+            r'сумм[ау]\s*([\s\S]{0,80})\s*руб',
             re.IGNORECASE
         ),
     ]
+
+    def extract_amount_from_snippet(snippet: str) -> Optional[float]:
+        amount = extract_last_amount_from_text(snippet)
+        if amount:
+            return amount
+        integers = re.findall(r'\d[\d\s]{3,}', snippet)
+        for raw in reversed(integers):
+            value = parse_amount(raw)
+            if value >= 1000 and value not in range(2000, 2031):
+                return value
+        return None
+
+    upd_pages: Dict[Tuple[str, str], List[str]] = {}
+    last_key: Optional[Tuple[str, str]] = None
+
     for page in pages:
-        if "упд" not in page.lower() and "передаточн" not in page.lower():
+        lowered = page.lower()
+        if "упд" not in lowered and "передаточн" not in lowered and "счет-фактур" not in lowered:
             continue
-        for match in pattern.finditer(page):
-            number, date_raw = match.groups()
-            date_candidate = parse_date_str(date_raw)
-            if not date_candidate:
-                date_candidate = parse_ru_text_date(date_raw)
-            date_str = date_candidate.strftime("%d.%m.%Y") if date_candidate else ""
-            key = (number, date_str)
-            if key in seen:
+        matches = list(pattern.finditer(page))
+        if matches:
+            for match in matches:
+                number, date_raw = match.groups()
+                date_candidate = parse_date_str(date_raw) or parse_ru_text_date(date_raw)
+                date_str = date_candidate.strftime("%d.%m.%Y") if date_candidate else ""
+                key = (number.strip(), date_str)
+                upd_pages.setdefault(key, []).append(page)
+                last_key = key
+        else:
+            if last_key:
+                upd_pages[last_key].append(page)
+
+    for (number, date_str), page_list in upd_pages.items():
+        if (number, date_str) in seen:
+            continue
+        seen.add((number, date_str))
+        combined_text = "\n".join(page_list)
+        date_candidate = parse_date_str(date_str) or parse_ru_text_date(date_str)
+        details = extract_transport_details(combined_text, allow_llm=False)
+        amount_value = None
+        for amount_pattern in amount_patterns:
+            amount_matches = amount_pattern.findall(combined_text)
+            if not amount_matches:
                 continue
-            seen.add(key)
-            amount_value = None
-            for amount_pattern in amount_patterns:
-                amount_matches = amount_pattern.findall(page)
-                if not amount_matches:
-                    continue
-                for match in reversed(amount_matches):
-                    amount_value = extract_last_amount_from_text(match)
-                    if amount_value:
-                        break
+            for match in reversed(amount_matches):
+                amount_value = extract_amount_from_snippet(match)
                 if amount_value:
                     break
-            upd_docs.append({
-                "number": number.strip(),
-                "date": date_candidate,
-                "label": f"УПД № {number.strip()} от {date_str}",
-                "amount": amount_value,
-            })
+            if amount_value:
+                break
+        upd_entry = {
+            "number": number.strip(),
+            "date": date_candidate,
+            "label": f"УПД № {number.strip()} от {date_str}",
+            "amount": amount_value,
+        }
+        if details:
+            upd_entry.update(details)
+        upd_docs.append(upd_entry)
     return upd_docs
 
 
@@ -3229,10 +3943,22 @@ def extract_cargo_docs_from_pages(
         "торг-12",
         "торг-13",
         "м-15",
+        "трн",
         "перечень материальных ценностей",
         "доверенност",
         "акт осмотра",
         "акт контроля",
+        # Дополнительные маркеры для лучшего определения
+        " тн ",  # ТН как аббревиатура
+        "ттн",   # ТТН
+        "cmr",   # CMR накладная
+        "грузоотправител",  # Поле в ТН
+        "грузополучател",   # Поле в ТН
+        "перевозчик",       # Поле в ТН
+        "пункт погрузки",   # Поле в ТН
+        "пункт разгрузки",  # Поле в ТН
+        "сведения о грузе", # Поле в ТН
+        "транспортное средство",  # Поле в ТН
     )
     last_context: Dict[str, Any] = {}
     patterns = [
@@ -3270,6 +3996,71 @@ def extract_cargo_docs_from_pages(
                 r'транспортная\s+накладная\s+(?:заказ|форма)[^\n]*\n'
                 r'[^\n]*№\s*([A-Za-zА-Яа-я0-9/\s-]+?)(?:\s+Дата|\s*\n)',
                 re.IGNORECASE | re.MULTILINE
+            ),
+        ),
+        # Сокращение "ТН №" или "ТН:" с номером
+        (
+            "Транспортная накладная",
+            re.compile(
+                r'(?:^|\s)ТН\s*[№:]\s*([A-Za-zА-Яа-я0-9/\\-]+)',
+                re.IGNORECASE
+            ),
+        ),
+        # Сокращение "ТрН №" или "Номер ТрН"
+        (
+            "Транспортная накладная",
+            re.compile(
+                r'(?:Номер\s*)?ТрН\s*[№:]*\s*([A-Za-zА-Яа-я0-9/\\-]+)',
+                re.IGNORECASE
+            ),
+        ),
+        (
+            "Транспортная накладная",
+            re.compile(
+                r'Номер\s*ТрН[\s_]*\n?\s*([A-Za-zА-Яа-я0-9/\\-]{3,})',
+                re.IGNORECASE | re.MULTILINE
+            ),
+        ),
+        # ТТН (товарно-транспортная накладная) с номером
+        (
+            "Товарно-транспортная накладная",
+            re.compile(
+                r'(?:^|\s)ТТН\s*[№:]\s*([A-Za-zА-Яа-я0-9/\\-]+)',
+                re.IGNORECASE
+            ),
+        ),
+        # Накладная ТОРГ-13
+        (
+            "Накладная ТОРГ-13",
+            re.compile(
+                r'(?:накладн[^\n]{0,30}?торг[-\s]*13|торг[-\s]*13[^\n]{0,30}?накладн)'
+                r'[^\n]{0,40}?(?:№|N[оo0])?\s*[:№]?\s*([A-Za-zА-Яа-я0-9/\\-]+)',
+                re.IGNORECASE
+            ),
+        ),
+        # CMR накладная
+        (
+            "CMR накладная",
+            re.compile(
+                r'CMR[^\n]{0,40}?(?:№|N[оo0]|номер)\s*[:№]?\s*([A-Za-zА-Яа-я0-9/\\-]+)',
+                re.IGNORECASE
+            ),
+        ),
+        # Формат "Накладная № XXX" без уточнения типа
+        (
+            "Транспортная накладная",
+            re.compile(
+                r'(?:^|\n)\s*накладн[а-я]*\s*[№#]\s*([A-Za-zА-Яа-я0-9/\\-]+)',
+                re.IGNORECASE | re.MULTILINE
+            ),
+        ),
+        # Формат "№ XXX" после слов "грузоотправитель" или "перевозчик" (признак ТН)
+        (
+            "Транспортная накладная",
+            re.compile(
+                r'(?:грузоотправител|грузополучател|перевозчик)[^\n]{0,100}'
+                r'(?:накладн[а-я]*\s*)?№\s*([A-Za-zА-Яа-я0-9/\\-]{3,})',
+                re.IGNORECASE
             ),
         ),
     ]
@@ -3366,6 +4157,9 @@ def extract_cargo_docs_from_pages(
                 # Пропускаем ложные номера
                 if not number or number.lower() in ('экземпляр', 'форма', 'дата', '1', '2', '3', '4'):
                     continue
+                # Пропускаем номера без цифр (слова/заголовки)
+                if not re.search(r'\d', number):
+                    continue
                 # Пропускаем слишком короткие номера (менее 3 символов без пробелов)
                 if len(number.replace(' ', '')) < 3:
                     continue
@@ -3411,6 +4205,42 @@ def extract_cargo_docs_from_pages(
                         if date_str else f"Транспортная накладная № {number}"
                     )
                     add_cargo_doc("Транспортная накладная", number, date_value, label)
+
+        # Fallback: ТН без явного номера, но с признаками транспортной накладной
+        # Определяем по наличию ключевых полей
+        tn_indicators = [
+            "грузоотправитель",
+            "грузополучатель",
+            "перевозчик",
+            "пункт погрузки",
+            "пункт разгрузки",
+            "транспортное средство",
+            "водитель",
+            "сведения о грузе",
+        ]
+        tn_score = sum(1 for ind in tn_indicators if ind in lowered)
+        # Если есть хотя бы 4 признака ТН, это скорее всего транспортная накладная
+        has_tn_title = "транспортная накладная" in lowered or "ттн" in lowered
+        if has_tn_title and tn_score >= 3 and len(cargo_docs) == 0:
+            # Извлекаем данные даже без номера
+            date_candidate = extract_first_date(page)
+            if page_details:
+                # Создаём ТН на основе извлечённых данных
+                label_parts = ["Транспортная накладная"]
+                if date_candidate:
+                    label_parts.append(f"от {date_candidate.strftime('%d.%m.%Y')}")
+                if page_details.get("load_date"):
+                    label_parts.append(f"(погрузка {page_details['load_date'].strftime('%d.%m.%Y')})")
+                add_cargo_doc(
+                    "Транспортная накладная",
+                    "",
+                    date_candidate or page_details.get("load_date"),
+                    " ".join(label_parts)
+                )
+                logger.debug(
+                    f"ТН без номера определена по признакам (score={tn_score}): "
+                    f"{label_parts}"
+                )
 
         if "акт контроля" in lowered:
             if re.search(
@@ -3467,7 +4297,10 @@ def extract_cargo_docs_from_pages(
                 f"Экспедиторская расписка № {number} от {date_str}"
                 if number and date_str else (
                     f"Экспедиторская расписка № {number}"
-                    if number else "Экспедиторская расписка"
+                    if number else (
+                        f"Экспедиторская расписка от {date_str}"
+                        if date_str else "Экспедиторская расписка"
+                    )
                 )
             )
             add_cargo_doc(
@@ -3492,11 +4325,17 @@ def extract_cargo_docs_from_pages(
             )
 
         if "инструкция для водителя" in lowered:
+            date_candidate = extract_first_date(page)
+            date_str = date_candidate.strftime("%d.%m.%Y") if date_candidate else ""
+            label = (
+                f"Инструкция для водителя от {date_str}"
+                if date_str else "Инструкция для водителя"
+            )
             add_cargo_doc(
                 "Инструкция для водителя",
                 "",
-                extract_first_date(page),
-                "Инструкция для водителя"
+                date_candidate,
+                label
             )
 
         if "маршрутный лист" in lowered:
@@ -3624,7 +4463,7 @@ def extract_cargo_docs_from_pages(
             )
             add_cargo_doc("Накладная М-15", number, date_candidate, label)
 
-        if "торг-13" in lowered:
+        if "торг-13" in lowered and "трн" not in lowered and "транспортная накладная" not in lowered and "ттн" not in lowered:
             match = re.search(
                 r'накладная\s+([A-Za-zА-Яа-я0-9/\\-]+)\s+'
                 r'(\d{2}[./]\d{2}[./]\d{4})',
@@ -3700,6 +4539,34 @@ def extract_cargo_docs_from_pages(
                 if date_str else "Доверенность"
             )
             add_cargo_doc("Доверенность", "", date_candidate, label)
+
+        if "торг-13" in lowered and "трн" not in lowered and "транспортная накладная" not in lowered and "ттн" not in lowered:
+            match = re.search(
+                r'торг[-\s]*13[^\n]{0,40}?(?:№|N[оo0])?\s*[:№]?\s*([A-Za-zА-Яа-я0-9/\\-]+)?'
+                r'(?:[^\n]{0,40}?от\s*(\d{2}[./]\d{2}[./]\d{4}))?',
+                page,
+                re.IGNORECASE
+            )
+            number = ""
+            date_candidate = None
+            if match:
+                number = (match.group(1) or "").strip()
+                if number and not re.search(r'\d', number):
+                    number = ""
+                if match.group(2):
+                    date_candidate = parse_date_str(match.group(2).replace('/', '.'))
+            if not date_candidate:
+                date_candidate = extract_first_date(page)
+            date_str = date_candidate.strftime("%d.%m.%Y") if date_candidate else ""
+            if number or date_str:
+                label = (
+                    f"Накладная ТОРГ-13 № {number} от {date_str}"
+                    if number and date_str else (
+                        f"Накладная ТОРГ-13 № {number}"
+                        if number else f"Накладная ТОРГ-13 от {date_str}"
+                    )
+                )
+                add_cargo_doc("Накладная ТОРГ-13", number, date_candidate, label)
 
     # Постобработка: объединяем данные для накладных с одинаковыми номерами
     # (одна накладная может занимать несколько страниц PDF)
@@ -4298,14 +5165,26 @@ def extract_parties_from_pages(pages: List[str]) -> Dict[str, Dict[str, str]]:
     # Ролевое извлечение: заявки и договоры
     role_plaintiff = extract_party_from_role(
         pages,
-        ("исполнитель", "перевозчик"),
+        ("перевозчик",),
         inn_name_map
     )
+    if not role_plaintiff:
+        role_plaintiff = extract_party_from_role(
+            pages,
+            ("исполнитель",),
+            inn_name_map
+        )
     role_defendant = extract_party_from_role(
         pages,
-        ("заказчик", "экспедитор"),
+        ("экспедитор",),
         inn_name_map
     )
+    if not role_defendant:
+        role_defendant = extract_party_from_role(
+            pages,
+            ("заказчик",),
+            inn_name_map
+        )
 
     if "plaintiff" not in result or not result.get("plaintiff"):
         result["plaintiff"] = role_plaintiff
@@ -4459,25 +5338,163 @@ def assign_invoices_to_applications(
     applications: List[Dict[str, Any]],
     invoices: List[Dict[str, Any]]
 ) -> Dict[str, Dict[str, Any]]:
-    assignment = {}
+    assignment: Dict[str, Dict[str, Any]] = {}
     available = invoices.copy()
-    for app in sorted(applications, key=lambda item: item.get("date") or datetime.min):
+
+    def score_doc_to_application(doc: Dict[str, Any], app: Dict[str, Any]) -> Tuple[int, List[str]]:
+        def _surname(value: Optional[str]) -> str:
+            if not value:
+                return ""
+            token = str(value).strip().split()[0]
+            return re.sub(r'[^a-zа-я]', '', token.lower())
+
+        def _score_date_relaxed(first, second, full_points: int, near_points: int, near_days: int = 3) -> int:
+            first_dt = _coerce_date(first)
+            second_dt = _coerce_date(second)
+            if not first_dt or not second_dt:
+                return 0
+            delta = abs((first_dt - second_dt).days)
+            if delta == 0:
+                return full_points
+            if delta <= near_days:
+                return near_points
+            return 0
+
+        score = 0
+        reasons: List[str] = []
+
+        app_number = app.get("number")
+        doc_app_number = doc.get("application_number")
+        if app_number and doc_app_number and app_number == doc_app_number:
+            score += 25
+            reasons.append("номер заявки")
+
+        load_score = _score_date_relaxed(
+            doc.get("load_date"),
+            app.get("load_date"),
+            10,
+            5,
+            3,
+        )
+        if load_score:
+            score += load_score
+            reasons.append("дата погрузки")
+
+        unload_score = _score_date_relaxed(
+            doc.get("unload_date"),
+            app.get("unload_date"),
+            8,
+            4,
+            3,
+        )
+        if unload_score:
+            score += unload_score
+            reasons.append("дата разгрузки")
+
+        doc_score = _score_date_relaxed(
+            doc.get("date"),
+            app.get("date"),
+            4,
+            2,
+            3,
+        )
+        if doc_score:
+            score += doc_score
+            reasons.append("дата документа")
+
+        doc_driver = normalize_person_key(doc.get("driver_name"))
+        app_driver = normalize_person_key(app.get("driver_name"))
+        if doc_driver and app_driver and doc_driver == app_driver:
+            score += 6
+            reasons.append("водитель")
+        else:
+            doc_surname = _surname(doc.get("driver_name"))
+            app_surname = _surname(app.get("driver_name"))
+            if doc_surname and app_surname and doc_surname == app_surname:
+                score += 3
+                reasons.append("фамилия водителя")
+
+        app_amount = app.get("amount") or 0.0
+        doc_amount = doc.get("amount") or 0.0
+        try:
+            app_amount = float(app_amount)
+            doc_amount = float(doc_amount)
+        except (TypeError, ValueError):
+            app_amount = 0.0
+            doc_amount = 0.0
+        if app_amount > 0 and doc_amount > 0:
+            if abs(doc_amount - app_amount) / app_amount <= 0.05:
+                score += 6
+                reasons.append("сумма по заявке")
+            elif abs(doc_amount - app_amount * 1.2) / (app_amount * 1.2) <= 0.05:
+                score += 5
+                reasons.append("сумма с НДС")
+
+        doc_vehicle = normalize_vehicle_plate(doc.get("vehicle_plate") or "")
+        app_vehicle = normalize_vehicle_plate(app.get("vehicle_plate") or "")
+        if doc_vehicle and app_vehicle and doc_vehicle == app_vehicle:
+            score += 4
+            reasons.append("ТС")
+
+        doc_trailer = normalize_vehicle_plate(doc.get("trailer_plate") or "")
+        app_trailer = normalize_vehicle_plate(app.get("trailer_plate") or "")
+        if doc_trailer and app_trailer and doc_trailer == app_trailer:
+            score += 3
+            reasons.append("прицеп")
+
+        return score, reasons
+
+    # Сначала жёсткое сопоставление по номеру заявки
+    for inv in list(available):
+        app_number = inv.get("application_number")
+        if not app_number:
+            continue
+        match_app = next(
+            (app for app in applications if app.get("number") == app_number),
+            None
+        )
+        if match_app and match_app.get("label") not in assignment:
+            assignment[match_app["label"]] = inv
+            available.remove(inv)
+
+    remaining_apps = [
+        app for app in applications
+        if app.get("label") not in assignment
+    ]
+
+    for app in sorted(remaining_apps, key=lambda item: item.get("date") or datetime.min):
         if not available:
             break
-        app_date = app.get("date")
-        candidates = [
-            inv for inv in available
-            if inv.get("date") and app_date and inv["date"] >= app_date
-        ]
-        if candidates:
-            chosen = min(candidates, key=lambda inv: inv["date"])
-        else:
-            chosen = min(
-                available,
-                key=lambda inv: inv.get("date") or datetime.max
+        scored = []
+        for inv in available:
+            score, reasons = score_doc_to_application(inv, app)
+            if score > 0:
+                scored.append((score, inv, reasons))
+        if scored:
+            scored.sort(
+                key=lambda item: (
+                    item[0],
+                    item[1].get("date") or datetime.min
+                ),
+                reverse=True,
             )
+            chosen = scored[0][1]
+        else:
+            app_date = app.get("date")
+            candidates = [
+                inv for inv in available
+                if inv.get("date") and app_date and inv["date"] >= app_date
+            ]
+            if candidates:
+                chosen = min(candidates, key=lambda inv: inv["date"])
+            else:
+                chosen = min(
+                    available,
+                    key=lambda inv: inv.get("date") or datetime.max
+                )
         assignment[app["label"]] = chosen
         available.remove(chosen)
+
     return assignment
 
 
@@ -4485,25 +5502,146 @@ def assign_upd_to_applications(
     applications: List[Dict[str, Any]],
     upd_docs: List[Dict[str, Any]]
 ) -> Dict[str, Dict[str, Any]]:
-    assignment = {}
+    assignment: Dict[str, Dict[str, Any]] = {}
     available = upd_docs.copy()
-    for app in sorted(applications, key=lambda item: item.get("date") or datetime.min):
+
+    def score_doc_to_application(doc: Dict[str, Any], app: Dict[str, Any]) -> Tuple[int, List[str]]:
+        def _surname(value: Optional[str]) -> str:
+            if not value:
+                return ""
+            token = str(value).strip().split()[0]
+            return re.sub(r'[^a-zа-я]', '', token.lower())
+
+        def _score_date_relaxed(first, second, full_points: int, near_points: int, near_days: int = 3) -> int:
+            first_dt = _coerce_date(first)
+            second_dt = _coerce_date(second)
+            if not first_dt or not second_dt:
+                return 0
+            delta = abs((first_dt - second_dt).days)
+            if delta == 0:
+                return full_points
+            if delta <= near_days:
+                return near_points
+            return 0
+
+        score = 0
+        reasons: List[str] = []
+
+        app_number = app.get("number")
+        doc_app_number = doc.get("application_number")
+        if app_number and doc_app_number and app_number == doc_app_number:
+            score += 25
+            reasons.append("номер заявки")
+
+        load_score = _score_date_relaxed(
+            doc.get("load_date"),
+            app.get("load_date"),
+            10,
+            5,
+            3,
+        )
+        if load_score:
+            score += load_score
+            reasons.append("дата погрузки")
+
+        unload_score = _score_date_relaxed(
+            doc.get("unload_date"),
+            app.get("unload_date"),
+            8,
+            4,
+            3,
+        )
+        if unload_score:
+            score += unload_score
+            reasons.append("дата разгрузки")
+
+        doc_score = _score_date_relaxed(
+            doc.get("date"),
+            app.get("date"),
+            4,
+            2,
+            3,
+        )
+        if doc_score:
+            score += doc_score
+            reasons.append("дата документа")
+
+        doc_driver = normalize_person_key(doc.get("driver_name"))
+        app_driver = normalize_person_key(app.get("driver_name"))
+        if doc_driver and app_driver and doc_driver == app_driver:
+            score += 6
+            reasons.append("водитель")
+        else:
+            doc_surname = _surname(doc.get("driver_name"))
+            app_surname = _surname(app.get("driver_name"))
+            if doc_surname and app_surname and doc_surname == app_surname:
+                score += 3
+                reasons.append("фамилия водителя")
+
+        doc_vehicle = normalize_vehicle_plate(doc.get("vehicle_plate") or "")
+        app_vehicle = normalize_vehicle_plate(app.get("vehicle_plate") or "")
+        if doc_vehicle and app_vehicle and doc_vehicle == app_vehicle:
+            score += 4
+            reasons.append("ТС")
+
+        doc_trailer = normalize_vehicle_plate(doc.get("trailer_plate") or "")
+        app_trailer = normalize_vehicle_plate(app.get("trailer_plate") or "")
+        if doc_trailer and app_trailer and doc_trailer == app_trailer:
+            score += 3
+            reasons.append("прицеп")
+
+        return score, reasons
+
+    for upd in list(available):
+        app_number = upd.get("application_number")
+        if not app_number:
+            continue
+        match_app = next(
+            (app for app in applications if app.get("number") == app_number),
+            None
+        )
+        if match_app and match_app.get("label") not in assignment:
+            assignment[match_app["label"]] = upd
+            available.remove(upd)
+
+    remaining_apps = [
+        app for app in applications
+        if app.get("label") not in assignment
+    ]
+
+    for app in sorted(remaining_apps, key=lambda item: item.get("date") or datetime.min):
         if not available:
             break
-        app_date = app.get("date")
-        candidates = [
-            upd for upd in available
-            if upd.get("date") and app_date and upd["date"] >= app_date
-        ]
-        if candidates:
-            chosen = min(candidates, key=lambda upd: upd["date"])
-        else:
-            chosen = min(
-                available,
-                key=lambda upd: upd.get("date") or datetime.max
+        scored = []
+        for upd in available:
+            score, reasons = score_doc_to_application(upd, app)
+            if score > 0:
+                scored.append((score, upd, reasons))
+        if scored:
+            scored.sort(
+                key=lambda item: (
+                    item[0],
+                    item[1].get("date") or datetime.min
+                ),
+                reverse=True,
             )
+            chosen = scored[0][1]
+        else:
+            app_date = app.get("date")
+            candidates = [
+                upd for upd in available
+                if upd.get("date") and app_date and upd["date"] >= app_date
+            ]
+            if candidates:
+                chosen = min(candidates, key=lambda upd: upd["date"])
+            else:
+                chosen = min(
+                    available,
+                    key=lambda upd: upd.get("date") or datetime.max
+                )
         assignment[app["label"]] = chosen
         available.remove(chosen)
+
     return assignment
 
 
@@ -5006,6 +6144,10 @@ def assign_cargo_to_applications(
     applications: List[Dict[str, Any]],
     cargo_docs: List[Dict[str, Any]]
 ) -> Dict[str, List[Dict[str, Any]]]:
+    logger.info(
+        f"Связывание cargo_docs: {len(cargo_docs)} документов с "
+        f"{len(applications)} заявками"
+    )
     assignment: Dict[str, List[Dict[str, Any]]] = {
         app["label"]: [] for app in applications
     }
@@ -5099,6 +6241,20 @@ def assign_cargo_to_applications(
                 chosen = apps_sorted[0]
         if chosen:
             assignment[chosen["label"]].append(cargo)
+            logger.debug(
+                f"Cargo '{cargo.get('label')}' → '{chosen.get('label')}' "
+                f"(score={cargo.get('match_score', 0)}, reasons={cargo.get('match_reasons', [])})"
+            )
+        else:
+            logger.warning(
+                f"Cargo '{cargo.get('label')}' не связан ни с одной заявкой. "
+                f"Доступные данные: driver={cargo.get('driver_name')}, "
+                f"vehicle={cargo.get('vehicle_plate')}, date={cargo.get('date')}"
+            )
+    logger.info(
+        f"Результат связывания: "
+        + ", ".join(f"{k}={len(v)}" for k, v in assignment.items() if v)
+    )
     return assignment
 
 
@@ -5162,10 +6318,10 @@ def _is_latin_heavy_label(value: str) -> bool:
         return False
     latin = sum(ch.isascii() and ch.isalpha() for ch in letters)
     cyrillic = sum(bool(re.match(r"[А-Яа-яЁё]", ch)) for ch in letters)
-    if cyrillic:
-        return False
     ratio = latin / len(letters) if letters else 0
-    return ratio > 0.6
+    if cyrillic == 0:
+        return ratio > 0.6
+    return ratio > 0.6 and latin >= 4
 
 
 def filter_cargo_docs_for_output(
@@ -5176,7 +6332,8 @@ def filter_cargo_docs_for_output(
     if not cargo_docs:
         return []
     core_docs: List[Dict[str, Any]] = []
-    fallback_docs: List[Dict[str, Any]] = []
+    support_docs: List[Dict[str, Any]] = []
+    seen: Set[Tuple[str, str, str]] = set()
     for doc in cargo_docs:
         label = normalize_document_item(doc.get("label") or "")
         if not label:
@@ -5184,10 +6341,12 @@ def filter_cargo_docs_for_output(
         number = doc.get("number") or ""
         if _is_placeholder_doc_number(number):
             continue
-        if _is_latin_heavy_label(label):
+        is_latin_heavy = _is_latin_heavy_label(label)
+        if is_latin_heavy:
             lower_label = label.lower()
             if "cmr" not in lower_label and "tir" not in lower_label:
-                continue
+                if not number and not doc.get("date"):
+                    continue
         doc_date = doc.get("date")
         if isinstance(doc_date, datetime) and min_app_date:
             if doc_date < min_app_date - timedelta(days=120):
@@ -5200,11 +6359,23 @@ def filter_cargo_docs_for_output(
         is_core = (
             doc_type in _CARGO_SUPPORT_DOC_TYPES
         ) is False and any(marker in lower_label for marker in _CARGO_CORE_MARKERS)
+        has_signal = bool(number) or isinstance(doc_date, datetime) or any(
+            doc.get(key) for key in ("load_date", "unload_date", "vehicle_plate", "trailer_plate")
+        )
+        if doc_type in _CARGO_SUPPORT_DOC_TYPES and not has_signal and is_latin_heavy:
+            continue
+        if not is_core and doc_type not in _CARGO_SUPPORT_DOC_TYPES and not has_signal:
+            continue
+        date_key = doc_date.strftime("%d.%m.%Y") if isinstance(doc_date, datetime) else ""
+        key = (doc_type or label, str(number or label), date_key)
+        if key in seen:
+            continue
+        seen.add(key)
         if is_core:
             core_docs.append(doc)
         else:
-            fallback_docs.append(doc)
-    return core_docs or fallback_docs
+            support_docs.append(doc)
+    return core_docs + support_docs
 
 
 def get_matching_warnings(
@@ -5344,22 +6515,37 @@ def build_pretension_groups(
             max_app_date=max_app_date
         )
         cargo_dates = [item.get("date") for item in cargo_list if item.get("date")]
-        load_candidates: List[datetime] = []
+        load_date: Optional[datetime] = None
+        unload_date: Optional[datetime] = None
         app_load = app.get("load_date")
+        app_unload = app.get("unload_date")
         if app_load:
             app_load_dt = _coerce_date(app_load)
             if app_load_dt:
-                load_candidates.append(app_load_dt)
-        for cargo in cargo_list:
-            cargo_load = _coerce_date(cargo.get("load_date"))
-            if cargo_load:
-                load_candidates.append(cargo_load)
-        if not load_candidates:
+                load_date = app_load_dt
+        if app_unload:
+            app_unload_dt = _coerce_date(app_unload)
+            if app_unload_dt:
+                unload_date = app_unload_dt
+        if not load_date:
+            load_candidates: List[datetime] = []
             for cargo in cargo_list:
-                cargo_date = _coerce_date(cargo.get("date"))
-                if cargo_date:
-                    load_candidates.append(cargo_date)
-        load_date = min(load_candidates) if load_candidates else None
+                cargo_load = _coerce_date(cargo.get("load_date"))
+                if cargo_load:
+                    load_candidates.append(cargo_load)
+            if not load_candidates:
+                for cargo in cargo_list:
+                    cargo_date = _coerce_date(cargo.get("date"))
+                    if cargo_date:
+                        load_candidates.append(cargo_date)
+            load_date = min(load_candidates) if load_candidates else None
+        if not unload_date:
+            unload_candidates: List[datetime] = []
+            for cargo in cargo_list:
+                cargo_unload = _coerce_date(cargo.get("unload_date"))
+                if cargo_unload:
+                    unload_candidates.append(cargo_unload)
+            unload_date = min(unload_candidates) if unload_candidates else None
         invoice_amount = invoice.get("amount") if invoice else 0.0
         upd_amount = upd.get("amount") if upd else 0.0
         app_amount = app.get("amount") or 0.0
@@ -5376,6 +6562,7 @@ def build_pretension_groups(
             "upd": upd.get("label") if upd else None,
             "upd_date": upd.get("date") if upd else None,
             "upd_amount": upd_amount or 0.0,
+            "application_amount": app_amount or 0.0,
             "cargo_docs": [item["label"] for item in filtered_cargo],
             "cargo_docs_all": [item["label"] for item in cargo_list],
             "cargo_docs_details": cargo_list,
@@ -5384,16 +6571,19 @@ def build_pretension_groups(
             "payment_terms": terms_text or None,
             "payment_days": terms_days,
             "load_date": load_date,
+            "unload_date": unload_date,
             "docs_track_number": None,
             "docs_received_date": None,
             "shipping_source": None,
+            "vat_policy": app.get("vat_policy"),
         })
     return groups
 
 
 def assign_shipments_to_groups(
     groups: List[Dict[str, Any]],
-    shipments: List[Dict[str, Any]]
+    shipments: List[Dict[str, Any]],
+    force_use_all: bool = False
 ) -> None:
     if not groups or not shipments:
         return
@@ -5402,66 +6592,137 @@ def assign_shipments_to_groups(
         shipments_to_use = [
             item for item in shipments if item.get("api_records", 0) > 0
         ]
-    sorted_groups = sorted(
-        groups,
-        key=lambda item: (
-            max(item.get("cargo_dates") or []) if item.get("cargo_dates") else (
-                item.get("invoice_date")
-                or item.get("upd_date")
-                or item.get("application_date")
-                or datetime.min
-            )
+
+    def group_unload_date(item: Dict[str, Any]) -> Optional[datetime]:
+        unload = _coerce_date(item.get("unload_date"))
+        if unload:
+            return unload
+        for cargo in item.get("cargo_docs_details") or []:
+            unload = _coerce_date(cargo.get("unload_date"))
+            if unload:
+                return unload
+        return None
+
+    missing_unload = [
+        group.get("application") or group.get("invoice") or group.get("upd")
+        for group in groups
+        if not group_unload_date(group)
+    ]
+    if missing_unload:
+        raise ValueError(
+            "Не указана дата выгрузки в заявке или сопроводительных документах: "
+            + ", ".join([item for item in missing_unload if item])
         )
-    )
-    def _shipment_received_date(item: Dict[str, Any]) -> Optional[datetime]:
+
+    def group_date_value(item: Dict[str, Any]) -> datetime:
+        return group_unload_date(item) or datetime.min
+
+    def shipment_send_date(item: Dict[str, Any]) -> Optional[datetime]:
+        return _coerce_date(
+            item.get("send_date")
+            or item.get("sent_date")
+            or item.get("send_date_str")
+        )
+
+    def shipment_received_date(item: Dict[str, Any]) -> Optional[datetime]:
         return _coerce_date(
             item.get("received_date")
             or item.get("received_date_str")
             or item.get("receive_date")
         )
 
+    missing_send = [
+        item for item in shipments_to_use
+        if not shipment_send_date(item)
+    ]
+    if missing_send:
+        missing_tracks = [
+            str(item.get("track_number") or "") for item in missing_send
+        ]
+        raise ValueError(
+            "Отсутствует дата отправления (send_date) для отправлений: "
+            + ", ".join([t for t in missing_tracks if t]) or "неизвестные"
+        )
+
+    sorted_groups = sorted(groups, key=group_date_value)
     sorted_shipments = sorted(
         shipments_to_use,
-        key=lambda item: _shipment_received_date(item) or datetime.max
+        key=lambda item: shipment_send_date(item) or datetime.max
     )
-    unassigned = [
-        group for group in sorted_groups
-        if not group.get("docs_received_date") or not group.get("docs_track_number")
-    ]
-    prev_date = None
-    for idx, shipment in enumerate(sorted_shipments):
-        ship_date = _shipment_received_date(shipment)
+
+    def apply_shipment(group: Dict[str, Any], shipment: Dict[str, Any]) -> None:
+        track_number = shipment.get("track_number")
+        received_date = shipment_received_date(shipment)
+        if track_number and not group.get("docs_track_number"):
+            group["docs_track_number"] = track_number
+        if received_date and not group.get("docs_received_date"):
+            group["docs_received_date"] = received_date.strftime("%d.%m.%Y")
+        if not group.get("shipping_source"):
+            group["shipping_source"] = normalize_shipping_source(
+                shipment.get("source")
+            )
+
+    # Количество отправлений не может быть больше количества заявок
+    if len(sorted_shipments) > len(sorted_groups):
+        raise ValueError("Количество отправлений больше количества заявок.")
+
+    group_index = 0
+    total_groups = len(sorted_groups)
+    total_shipments = len(sorted_shipments)
+
+    group_dates = [group_date_value(group) for group in sorted_groups]
+
+    for ship_index, shipment in enumerate(sorted_shipments):
+        ship_date = shipment_send_date(shipment)
         if not ship_date:
             continue
-        bucket = []
-        for group in list(unassigned):
-            group_date = (
-                max(group.get("cargo_dates") or []) if group.get("cargo_dates") else (
-                    group.get("invoice_date")
-                    or group.get("upd_date")
-                    or group.get("application_date")
-                )
+
+        # Максимальный индекс группы, чья дата выгрузки <= дате отправления
+        g_max = group_index - 1
+        for idx in range(group_index, total_groups):
+            if group_dates[idx] <= ship_date:
+                g_max = idx
+            else:
+                break
+        if g_max < group_index:
+            raise ValueError(
+                "Дата отправления меньше даты выгрузки для заявки: "
+                + (sorted_groups[group_index].get("application") or "")
             )
-            if not group_date:
-                continue
-            if group_date <= ship_date and (prev_date is None or group_date > prev_date):
-                bucket.append(group)
-        if not bucket and idx == len(sorted_shipments) - 1:
-            bucket = unassigned[:]
-        for group in bucket:
-            track_number = shipment.get("track_number")
-            if track_number and not group.get("docs_track_number"):
-                group["docs_track_number"] = track_number
-            if ship_date and not group.get("docs_received_date"):
-                group["docs_received_date"] = ship_date.strftime("%d.%m.%Y")
-            if not group.get("shipping_source"):
-                group["shipping_source"] = normalize_shipping_source(
-                    shipment.get("source")
+
+        # Ограничение по количеству, чтобы оставались группы на будущие отправления
+        count_limit = total_groups - total_shipments + ship_index
+        assign_end = min(g_max, count_limit)
+
+        # Ограничение по следующему отправлению: следующая заявка должна успеть
+        if ship_index < total_shipments - 1:
+            next_ship_date = shipment_send_date(sorted_shipments[ship_index + 1])
+            if not next_ship_date:
+                raise ValueError("Не найдена дата отправления для следующего трека.")
+            g_max_next = group_index - 1
+            for idx in range(group_index, total_groups):
+                if group_dates[idx] <= next_ship_date:
+                    g_max_next = idx
+                else:
+                    break
+            if g_max_next < group_index:
+                raise ValueError(
+                    "Дата отправления меньше даты выгрузки для заявки: "
+                    + (sorted_groups[group_index].get("application") or "")
                 )
-            if group in unassigned:
-                unassigned.remove(group)
-        if bucket:
-            prev_date = ship_date
+            assign_end = min(assign_end, g_max_next - 1)
+
+        if assign_end < group_index:
+            raise ValueError("Невозможно распределить отправления без остатка.")
+
+        for idx in range(group_index, assign_end + 1):
+            apply_shipment(sorted_groups[idx], shipment)
+        group_index = assign_end + 1
+
+    if group_index < total_groups:
+        raise ValueError(
+            "Есть заявки с датой выгрузки позже даты отправления документов."
+        )
 
 
 def build_documents_list_structured_for_groups(
@@ -5486,8 +6747,13 @@ def build_documents_list_structured_for_groups(
             structured.append((1, f"{doc};"))
         amount = group.get("amount") or 0.0
         if amount > 0:
+            decimals = 2 if abs(amount - round(amount)) > 0.004 else 0
+            amount_text = (
+                format_money_ru(amount, decimals)
+                if decimals == 2 else format_money(amount, decimals)
+            )
             structured.append(
-                (1, f"Цена перевозки {format_money(amount, 0)} руб.;")
+                (1, f"Цена перевозки {amount_text} руб.;")
             )
         track = group.get("docs_track_number")
         received = group.get("docs_received_date")
@@ -6100,63 +7366,168 @@ def calculate_pretension_interest_schedule(
         calendar = load_work_calendar(base_date.year)
         return add_working_days(base_date, days, calendar) if days > 0 else base_date
 
+    # Определяем fallback для payment_days, если default = 0
+    effective_default = default_payment_days
+    if effective_default <= 0:
+        # Собираем payment_days из групп, которые их имеют
+        group_days_values = []
+        for g in groups:
+            gd = g.get("payment_days")
+            if gd is not None:
+                try:
+                    gd_int = int(gd)
+                    if gd_int > 0:
+                        group_days_values.append(gd_int)
+                except (TypeError, ValueError):
+                    pass
+        if group_days_values:
+            # Используем наиболее часто встречающееся значение
+            effective_default = Counter(group_days_values).most_common(1)[0][0]
+
+    # Собираем все docs_received_date для fallback
+    all_received_dates = []
+    for g in groups:
+        rd = _coerce_date(g.get("docs_received_date"))
+        if rd:
+            all_received_dates.append(rd)
+    fallback_received_date = max(all_received_dates) if all_received_dates else None
+
     obligations: List[Dict[str, Any]] = []
     for group in groups:
-        amount = float(group.get("amount") or 0)
-        if amount <= 0:
+        invoice_amount = float(group.get("invoice_amount") or 0)
+        upd_amount = float(group.get("upd_amount") or 0)
+        app_amount = float(group.get("application_amount") or 0)
+        vat_policy = group.get("vat_policy")
+        if vat_policy == "without_vat" and app_amount > 0:
+            base_amount = app_amount
+        else:
+            base_amount = invoice_amount or upd_amount or app_amount or 0.0
+        if base_amount <= 0:
             continue
 
         received_str = group.get("docs_received_date")
         received_date = _coerce_date(received_str)
         load_date = _coerce_date(group.get("load_date"))
+        unload_date = _coerce_date(group.get("unload_date"))
 
         group_payment_days = group.get("payment_days")
         if group_payment_days is None:
-            group_payment_days = default_payment_days
+            group_payment_days = effective_default
         try:
             group_payment_days = int(group_payment_days)
         except (TypeError, ValueError):
             group_payment_days = 0
 
         terms_text = normalize_payment_terms(group.get("payment_terms") or "")
-        prepay_amount, prepay_days, prepay_base, remainder_days = parse_prepayment_terms_details(
-            terms_text
-        )
+        parts = extract_payment_parts_from_terms(terms_text)
+        if not parts:
+            parts = []
+            if group_payment_days and group_payment_days > 0:
+                parts.append({
+                    "size_type": "percent",
+                    "size_value": 100.0,
+                    "anchor": "receive_docs",
+                    "days": group_payment_days,
+                })
 
-        remainder_amount = amount
-        if prepay_amount > 0 and prepay_amount < amount:
-            remainder_amount = amount - prepay_amount
-        elif prepay_amount >= amount:
-            prepay_amount = amount
-            remainder_amount = 0.0
+        # Рассчитываем суммы частей
+        part_amounts: List[Optional[float]] = []
+        fixed_sum = 0.0
+        percent_sum = 0.0
+        remainder_indices: List[int] = []
+        for idx, part in enumerate(parts):
+            size_type = part.get("size_type")
+            size_value = part.get("size_value")
+            if size_type == "percent" and size_value:
+                percent_sum += float(size_value)
+                part_amounts.append(base_amount * float(size_value) / 100.0)
+            elif size_type == "fixed" and size_value:
+                fixed_sum += float(size_value)
+                part_amounts.append(float(size_value))
+            else:
+                remainder_indices.append(idx)
+                part_amounts.append(None)
+
+        # Если фиксированные суммы из заявки (без НДС), а база из счёта (с НДС),
+        # пропорционально приводим фиксированные суммы к базе.
+        if (
+            vat_policy != "without_vat"
+            and app_amount > 0
+            and base_amount > 0
+            and fixed_sum > 0
+            and percent_sum == 0
+        ):
+            ratio = base_amount / app_amount if app_amount else 1.0
+            if 1.15 <= ratio <= 1.25:
+                for idx, part in enumerate(parts):
+                    if part.get("size_type") == "fixed" and part_amounts[idx] is not None:
+                        part_amounts[idx] = float(part_amounts[idx]) * ratio
+                fixed_sum = sum(
+                    part_amounts[idx] or 0.0
+                    for idx, part in enumerate(parts)
+                    if part.get("size_type") == "fixed"
+                )
+
+        known_sum = sum(value for value in part_amounts if value is not None)
+        if remainder_indices:
+            remainder_amount = base_amount - known_sum
+            if remainder_amount < 0:
+                if fixed_sum > 0 and percent_sum == 0:
+                    ratio = base_amount / fixed_sum if fixed_sum else 0
+                    for idx, part in enumerate(parts):
+                        if part.get("size_type") == "fixed":
+                            part_amounts[idx] = float(part.get("size_value") or 0) * ratio
+                    known_sum = sum(value for value in part_amounts if value is not None)
+                    remainder_amount = base_amount - known_sum
+                if remainder_amount < 0:
+                    remainder_amount = 0.0
+            for idx in remainder_indices:
+                part_amounts[idx] = remainder_amount if remainder_amount > 0 else 0.0
+
+        # Корректируем на копейки, чтобы сумма частей равнялась базе
+        final_sum = sum(value or 0 for value in part_amounts)
+        delta = round(base_amount - final_sum, 2)
+        if abs(delta) >= 0.01:
+            # корректируем последнюю часть
+            for idx in range(len(part_amounts) - 1, -1, -1):
+                if part_amounts[idx] is not None:
+                    part_amounts[idx] = (part_amounts[idx] or 0) + delta
+                    break
 
         group_label = group.get("application") or group.get("invoice") or group.get("upd")
 
-        if prepay_amount > 0:
-            base_date = load_date if prepay_base == "load" else load_date
-            due_date = calculate_due_date(base_date, prepay_days)
-            if due_date:
-                obligations.append({
-                    "group_label": group_label,
-                    "due_date": due_date,
-                    "amount": prepay_amount,
-                })
-
-        if remainder_amount > 0:
-            if remainder_days is None:
-                remainder_days = group_payment_days
+        for part, part_amount in zip(parts, part_amounts):
+            if not part_amount or part_amount <= 0:
+                continue
+            anchor = part.get("anchor") or "receive_docs"
+            days_value = part.get("days")
             try:
-                remainder_days = int(remainder_days)
+                days_value = int(days_value) if days_value is not None else 0
             except (TypeError, ValueError):
-                remainder_days = 0
-            if remainder_days > 0 and received_date:
-                due_date = calculate_due_date(received_date, remainder_days)
-                if due_date:
-                    obligations.append({
-                        "group_label": group_label,
-                        "due_date": due_date,
-                        "amount": remainder_amount,
-                    })
+                days_value = 0
+            if days_value <= 0:
+                continue
+
+            if anchor == "load":
+                event_date = load_date
+            elif anchor == "unload":
+                event_date = unload_date
+            else:
+                event_date = received_date
+            # Fallback на последнюю известную дату получения документов
+            if not event_date and fallback_received_date:
+                event_date = fallback_received_date
+            if not event_date:
+                continue
+
+            due_date = calculate_due_date(event_date, days_value)
+            if not due_date:
+                continue
+            obligations.append({
+                "group_label": group_label,
+                "due_date": due_date,
+                "amount": part_amount,
+            })
 
     events: Dict[datetime, float] = {}
 
@@ -7312,12 +8683,77 @@ def insert_awareness_block(doc, awareness_text: str):
     run.font.size = Pt(12)
 
 
+def build_prior_pretensions_summary(
+    pretensions: List[Dict[str, Any]]
+) -> str:
+    sentences: List[str] = []
+    for item in pretensions:
+        if not isinstance(item, dict):
+            continue
+        claimant_role = item.get("claimant_role")
+        if claimant_role == "plaintiff":
+            parts: List[str] = [
+                "Ранее Перевозчиком была направлена претензия о простое в адрес Заказчика"
+            ]
+        elif claimant_role == "defendant":
+            parts = ["Ранее Заказчиком предъявлялась претензия о простое"]
+        else:
+            parts = ["Ранее была направлена претензия о простое"]
+        application_label = item.get("application_label") or ""
+        if application_label:
+            normalized_label = re.sub(
+                r'^Заявка\b',
+                'заявке',
+                application_label,
+                flags=re.IGNORECASE
+            )
+            parts.append(f"по {normalized_label}")
+        pretension_number = item.get("pretension_number")
+        pretension_date = item.get("pretension_date")
+        if pretension_number or pretension_date:
+            details = []
+            if pretension_number:
+                details.append(f"№ {pretension_number}")
+            if pretension_date:
+                details.append(f"от {pretension_date}")
+            parts.append(f"({ ' '.join(details) })")
+        amount = parse_amount(item.get("amount"))
+        if amount > 0:
+            parts.append(f"на сумму {format_money(amount, 0)} руб.")
+        hours = item.get("hours")
+        rate = parse_amount(item.get("rate"))
+        if hours and rate > 0:
+            parts.append(
+                f"(простой {hours} ч × {format_money(rate, 0)} руб./час)"
+            )
+        base_sentence = " ".join([part for part in parts if part]).strip()
+        if base_sentence and not base_sentence.endswith("."):
+            base_sentence += "."
+
+        tail_sentences: List[str] = []
+        payment_days = item.get("payment_days")
+        payment_type = item.get("payment_days_type")
+        if payment_days:
+            day_word = "банковских" if payment_type == "banking" else "рабочих"
+            tail_sentences.append(
+                f"Срок оплаты — {payment_days} {day_word} дней."
+            )
+        attachments = item.get("attachments") or []
+        if attachments:
+            tail_sentences.append(
+                "Приложения: " + "; ".join(attachments) + "."
+            )
+        full_sentence = " ".join([base_sentence] + tail_sentences).strip()
+        if full_sentence:
+            sentences.append(full_sentence)
+    return " ".join(sentences)
+
+
 def adjust_pretension_quality_section(
     doc,
-    documents_count: Optional[int]
+    documents_count: Optional[int],
+    prior_pretensions: Optional[List[Dict[str, Any]]] = None
 ) -> None:
-    if documents_count != 1:
-        return
     plural_text = (
         "Все перевозки выполнены надлежащим образом и приняты без претензий. "
         "Письменные претензии в установленный срок не заявлялись."
@@ -7326,12 +8762,27 @@ def adjust_pretension_quality_section(
         "Перевозка выполнена надлежащим образом и принята без претензий. "
         "Письменные претензии в установленный срок не заявлялись."
     )
+    prior_summary = build_prior_pretensions_summary(prior_pretensions or [])
+    if prior_summary:
+        base_text = (
+            "Перевозка выполнена надлежащим образом и принята без претензий "
+            "по качеству."
+            if documents_count == 1 else
+            "Все перевозки выполнены надлежащим образом и приняты без претензий "
+            "по качеству."
+        )
+        replacement = f"{base_text} {prior_summary}".strip()
+    elif documents_count == 1:
+        replacement = singular_text
+    else:
+        replacement = plural_text
+
     for paragraph in doc.paragraphs:
-        if plural_text in paragraph.text:
-            paragraph.text = paragraph.text.replace(plural_text, singular_text)
+        if plural_text in paragraph.text or singular_text in paragraph.text:
+            paragraph.text = replacement
             return
-        if "Все перевозки выполнены" in paragraph.text:
-            paragraph.text = singular_text
+        if "Все перевозки выполнены" in paragraph.text or "Перевозка выполнена" in paragraph.text:
+            paragraph.text = replacement
             return
 
 
@@ -7512,7 +8963,11 @@ def create_pretension_document(
     groups = data.get("pretension_groups") or data.get("document_groups")
     if isinstance(groups, list) and groups:
         documents_count = len(groups)
-    adjust_pretension_quality_section(doc, documents_count)
+    adjust_pretension_quality_section(
+        doc,
+        documents_count,
+        prior_pretensions=data.get("prior_pretensions")
+    )
     insert_pretension_interest_table(
         doc,
         interest_data.get("detailed_calc", []),
@@ -9099,6 +10554,18 @@ async def finish_pretension(update, context):
         payment_days = int(re.sub(r"[^\d]", "", str(payment_days_raw)))
     except ValueError:
         payment_days = 0
+
+    # Подстраховка: если по отдельным заявкам нет условий оплаты,
+    # используем общие условия/сроки (из текста или договора).
+    default_terms_fallback = normalize_payment_terms(
+        claim_data.get("payment_terms", "")
+    )
+    if groups and default_terms_fallback:
+        for group in groups:
+            if not normalize_payment_terms(group.get("payment_terms") or ""):
+                group["payment_terms"] = default_terms_fallback
+                if payment_days and not group.get("payment_days"):
+                    group["payment_days"] = payment_days
 
     interest_data = {"total_interest": 0.0, "detailed_calc": []}
     partial_payments = claim_data.get("partial_payments_info") or []

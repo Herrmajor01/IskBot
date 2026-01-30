@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -124,6 +125,18 @@ def extract_pages(
         config = m.get_vision_config()
         max_pages = int(config.get("max_pages") or 0)
         targeted_pages = m.collect_targeted_ocr_pages(pages, processed_low_pages)
+        name_lower = path.name.lower()
+        if "упд" in name_lower or "upd" in name_lower:
+            upd_limit_raw = os.getenv("VISION_UPD_MAX_PAGES")
+            if upd_limit_raw is not None:
+                try:
+                    upd_limit = int(upd_limit_raw)
+                except ValueError:
+                    upd_limit = 0
+                if upd_limit <= 0:
+                    targeted_pages = list(range(1, len(pages) + 1))
+                else:
+                    targeted_pages = list(range(1, min(len(pages), upd_limit) + 1))
         if targeted_pages:
             if max_pages > 0:
                 remaining = max_pages - len(set(processed_low_pages))
@@ -167,6 +180,116 @@ def extract_pages(
     return pages, low_pages
 
 
+def apply_manual_shipments(
+    shipments: List[dict],
+    input_dir: Path
+) -> Tuple[List[dict], bool]:
+    manual_path = os.getenv("MANUAL_SHIPMENTS_FILE")
+    candidates = []
+    if manual_path:
+        candidates.append(Path(manual_path))
+    candidates.append(input_dir / "manual_shipments.json")
+    candidates.append(Path("manual_shipments.json"))
+    manual_file = next((p for p in candidates if p.exists()), None)
+    if not manual_file:
+        return shipments, False
+
+    try:
+        with open(manual_file, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception as exc:
+        log(f"Не удалось прочитать manual_shipments.json: {exc}")
+        return shipments, False
+
+    manual_entries: List[dict] = []
+    if isinstance(payload, dict):
+        for track, value in payload.items():
+            if isinstance(value, dict):
+                date_str = value.get("received_date") or value.get("received") or value.get("date")
+                send_date = value.get("send_date") or value.get("sent_date")
+            else:
+                date_str = value
+                send_date = None
+            if not date_str:
+                continue
+            entry = {
+                "track_number": str(track),
+                "received_date": m.parse_date_str(str(date_str)) or date_str,
+                "received_date_str": str(date_str),
+                "source": "post",
+                "api_records": 1,
+            }
+            if send_date:
+                entry["send_date"] = send_date
+            manual_entries.append(entry)
+    elif isinstance(payload, list):
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            track = item.get("track_number") or item.get("track")
+            date_str = item.get("received_date") or item.get("received_date_str")
+            send_date = item.get("send_date") or item.get("sent_date")
+            if not track or not date_str:
+                continue
+            entry = {
+                "track_number": str(track),
+                "received_date": m.parse_date_str(str(date_str)) or date_str,
+                "received_date_str": str(date_str),
+                "source": "post",
+                "api_records": 1,
+            }
+            if send_date:
+                entry["send_date"] = send_date
+            manual_entries.append(entry)
+
+    if manual_entries:
+        log(f"Использую manual_shipments.json ({manual_file}) с {len(manual_entries)} отправлениями")
+        return manual_entries, True
+    return shipments, False
+
+
+def apply_manual_unload_dates(
+    applications: List[dict],
+    input_dir: Path
+) -> None:
+    manual_path = os.getenv("MANUAL_UNLOAD_DATES_FILE")
+    candidates = []
+    if manual_path:
+        candidates.append(Path(manual_path))
+    candidates.append(input_dir / "manual_unload_dates.json")
+    candidates.append(Path("manual_unload_dates.json"))
+    manual_file = next((p for p in candidates if p.exists()), None)
+    if not manual_file:
+        return
+
+    try:
+        with open(manual_file, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception as exc:
+        log(f"Не удалось прочитать manual_unload_dates.json: {exc}")
+        return
+
+    if not isinstance(payload, dict):
+        log("manual_unload_dates.json должен быть словарем {номер_заявки: дата}")
+        return
+
+    updated = 0
+    for app in applications:
+        number = app.get("number")
+        if not number:
+            continue
+        key = str(number).strip()
+        if key not in payload:
+            continue
+        date_raw = str(payload.get(key))
+        date_value = m.parse_date_str(date_raw)
+        if date_value:
+            app["unload_date"] = date_value
+            updated += 1
+    if updated:
+        log(f"Применены ручные даты выгрузки: {updated}")
+
+
 def select_pages_by_filename(pages_by_file: dict, keywords: List[str]) -> List[str]:
     selected: List[str] = []
     if not keywords:
@@ -206,6 +329,18 @@ def build_combined_text(
 
     combined_text = "\n\n".join(combined_texts)
     return combined_text, all_pages, low_pages_info, pages_by_file
+
+
+def extract_prior_pretensions(pages_by_file: dict) -> List[dict]:
+    pretensions: List[dict] = []
+    for name, pages in pages_by_file.items():
+        if "претенз" not in name.lower():
+            continue
+        text = "\n".join(pages)
+        info = m.extract_downtime_pretension_from_text(text, source_name=name)
+        if info:
+            pretensions.append(info)
+    return pretensions
 
 
 def main() -> int:
@@ -251,7 +386,7 @@ def main() -> int:
 
     app_pages = select_pages_by_filename(
         pages_by_file,
-        ["заявк"]
+        ["заявка", "заявки", "заявок"]
     ) or all_pages
     invoice_pages = select_pages_by_filename(
         pages_by_file,
@@ -263,7 +398,7 @@ def main() -> int:
     ) or all_pages
     cargo_pages = select_pages_by_filename(
         pages_by_file,
-        ["сопровод"]
+        ["сопровод", "накладн", "ттн", "тн", "cmr", "торг"]
     ) or all_pages
     shipment_pages = select_pages_by_filename(
         pages_by_file,
@@ -276,6 +411,7 @@ def main() -> int:
         app_pages,
         allow_llm=allow_transport_llm
     )
+    apply_manual_unload_dates(applications, input_dir)
     log(f"Applications: {len(applications)}")
 
     log("Extracting invoices")
@@ -292,6 +428,13 @@ def main() -> int:
         allow_llm=allow_transport_llm
     )
     log(f"Cargo docs: {len(cargo_docs)}")
+    for idx, cdoc in enumerate(cargo_docs):
+        log(
+            f"  [{idx+1}] {cdoc.get('label', 'N/A')} | "
+            f"driver={cdoc.get('driver_name', '-')} | "
+            f"vehicle={cdoc.get('vehicle_plate', '-')} | "
+            f"load_date={cdoc.get('load_date', '-')}"
+        )
 
     if args.use_vision and low_pages_info:
         log("Enriching cargo docs with vision")
@@ -304,10 +447,11 @@ def main() -> int:
     log("Extracting shipments")
     shipments = m.extract_cdek_shipments_from_pages(shipment_pages)
     shipments.extend(m.extract_postal_shipments_from_pages(shipment_pages))
+    shipments, manual_used = apply_manual_shipments(shipments, input_dir)
 
     # Обогащаем почтовые отправления через API Почты России (если настроено)
     config = m.get_russian_post_config()
-    if shipments and config.get("enabled"):
+    if shipments and config.get("enabled") and not manual_used:
         for shipment in shipments:
             if m.normalize_shipping_source(shipment.get("source")) != "post":
                 continue
@@ -342,8 +486,33 @@ def main() -> int:
         upd_docs=upd_docs,
         payment_terms_by_application=payment_terms_by_application
     )
-    m.assign_shipments_to_groups(groups, shipments)
+    m.assign_shipments_to_groups(
+        groups,
+        shipments,
+        force_use_all=manual_used
+    )
     log(f"Built {len(groups)} pretension groups")
+
+    prior_pretensions = extract_prior_pretensions(pages_by_file)
+    if prior_pretensions:
+        log(f"Detected downtime pretensions: {len(prior_pretensions)}")
+        unmatched = []
+        for pretension in prior_pretensions:
+            # Привязка претензии к перевозке: сопоставляем по номеру заявки.
+            app_norm = m.normalize_application_number(
+                pretension.get("application_number")
+            )
+            matched = False
+            for group in groups:
+                group_norm = m.normalize_application_number(group.get("application"))
+                if app_norm and group_norm == app_norm:
+                    group.setdefault("prior_pretensions", []).append(pretension)
+                    matched = True
+            if not matched:
+                unmatched.append(pretension)
+        claim_data["prior_pretensions"] = prior_pretensions
+        if unmatched:
+            claim_data["prior_pretensions_unmatched"] = unmatched
 
     payment_terms = None
     payment_days = None
@@ -380,9 +549,34 @@ def main() -> int:
     if payment_days:
         claim_data["payment_days"] = str(payment_days)
 
+    # Подстраховка: если нет условий оплаты по части заявок, применяем общие
+    if groups and payment_terms:
+        for group in groups:
+            if not m.normalize_payment_terms(group.get("payment_terms") or ""):
+                group["payment_terms"] = payment_terms
+                if payment_days and not group.get("payment_days"):
+                    group["payment_days"] = payment_days
+
     parties = m.extract_parties_from_pages(all_pages)
     if parties:
         m.apply_extracted_parties(claim_data, parties)
+
+    if prior_pretensions:
+        plaintiff_inn = re.sub(r"[^\d]", "", str(claim_data.get("plaintiff_inn") or ""))
+        defendant_inn = re.sub(r"[^\d]", "", str(claim_data.get("defendant_inn") or ""))
+        plaintiff_name = m.normalize_party_name(claim_data.get("plaintiff_name"))
+        defendant_name = m.normalize_party_name(claim_data.get("defendant_name"))
+        for pretension in prior_pretensions:
+            claimant_inn = re.sub(r"[^\d]", "", str(pretension.get("claimant_inn") or ""))
+            claimant_name = m.normalize_party_name(pretension.get("claimant_name"))
+            if claimant_inn and claimant_inn == plaintiff_inn:
+                pretension["claimant_role"] = "plaintiff"
+            elif claimant_inn and claimant_inn == defendant_inn:
+                pretension["claimant_role"] = "defendant"
+            elif claimant_name and claimant_name == plaintiff_name:
+                pretension["claimant_role"] = "plaintiff"
+            elif claimant_name and claimant_name == defendant_name:
+                pretension["claimant_role"] = "defendant"
 
     legal_docs = m.extract_legal_docs_from_pages(all_pages)
     if legal_docs:
@@ -694,6 +888,28 @@ def main() -> int:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_path = output_dir / f"pretension_generated_from_dir_{stamp}.docx"
 
+    protected_values = [
+        plaintiff_name,
+        defendant_name,
+        plaintiff_name_short,
+        defendant_name_short,
+    ]
+    for group in groups:
+        for key in ("application", "invoice", "upd"):
+            value = group.get(key)
+            if value:
+                protected_values.append(value)
+    if prior_pretensions:
+        for pretension in prior_pretensions:
+            pret_num = pretension.get("pretension_number")
+            pret_date = pretension.get("pretension_date")
+            if pret_num and pret_date:
+                protected_values.append(f"№ {pret_num} от {pret_date}")
+            if pretension.get("application_label"):
+                protected_values.append(pretension["application_label"])
+            for attachment in pretension.get("attachments") or []:
+                protected_values.append(attachment)
+
     result_docx = m.create_pretension_document(
         claim_data,
         interest_data,
@@ -701,12 +917,7 @@ def main() -> int:
         documents_list_structured=documents_list_structured,
         attachments=attachments,
         output_path=str(output_path),
-        proofread_protected_values=[
-            plaintiff_name,
-            defendant_name,
-            plaintiff_name_short,
-            defendant_name_short,
-        ],
+        proofread_protected_values=protected_values,
     )
 
     log(f"Generated: {result_docx}")

@@ -16,6 +16,62 @@ logging.basicConfig(
 )
 
 
+def _is_leap_year(year: int) -> bool:
+    """Проверяет, является ли год високосным."""
+    return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+
+
+def _days_in_year(year: int) -> int:
+    """Возвращает количество дней в году."""
+    return 366 if _is_leap_year(year) else 365
+
+
+def _split_period_by_years(
+    start: datetime,
+    end: datetime
+) -> List[Tuple[datetime, datetime, int]]:
+    """
+    Разбивает период на подпериоды по границам годов.
+
+    Returns:
+        Список кортежей (начало, конец, дней_в_году)
+    """
+    if start > end:
+        return []
+
+    result = []
+    current = start
+
+    while current <= end:
+        year_end = datetime(current.year, 12, 31)
+        period_end = min(year_end, end)
+        days_in_yr = _days_in_year(current.year)
+        result.append((current, period_end, days_in_yr))
+        current = period_end + timedelta(days=1)
+
+    return result
+
+
+def _calculate_interest_for_period(
+    amount: float,
+    start: datetime,
+    end: datetime,
+    rate: float
+) -> float:
+    """
+    Рассчитывает проценты по ст. 395 ГК РФ с учётом границ годов.
+    Корректно обрабатывает периоды, пересекающие границу года.
+    """
+    total_interest = 0.0
+
+    for period_start, period_end, year_days in _split_period_by_years(start, end):
+        days = (period_end - period_start).days + 1
+        interest = amount * days * rate / 100 / year_days
+        total_interest += interest
+
+    return round(total_interest, 2)
+
+
 def _parse_numeric_value(text: str) -> Optional[float]:
     cleaned = re.sub(r'[^\d.,+\-]', '', text or '')
     cleaned = cleaned.strip().rstrip('.').rstrip(',')
@@ -465,36 +521,46 @@ def calc_395_on_periods(
 ) -> Tuple[float, List[Dict[str, Any]]]:
     """
     Рассчитывает проценты по ст. 395 ГК РФ для списка периодов.
+    Корректно обрабатывает периоды, пересекающие границу года.
     """
     total_interest = 0.0
     detailed_calc = []
 
     for start, end, rate in periods:
-        days = (end - start).days + 1
-        year_days = 366 if (
-            start.year % 4 == 0 and
-            start.year % 100 != 0 or
-            start.year % 400 == 0
-        ) else 365
+        # Разбиваем период по годам для корректного расчёта
+        year_subperiods = _split_period_by_years(start, end)
 
-        interest = base_sum * days * rate / 100 / year_days
-        total_interest += interest
+        period_interest = 0.0
+        formula_parts = []
+
+        for sub_start, sub_end, year_days in year_subperiods:
+            sub_days = (sub_end - sub_start).days + 1
+            sub_interest = base_sum * sub_days * rate / 100 / year_days
+            period_interest += sub_interest
+            formula_parts.append(
+                f"{base_sum:,.2f} × {sub_days} × {rate}% / {year_days}"
+                .replace(',', ' ')
+            )
+
+        period_interest = round(period_interest, 2)
+        total_interest += period_interest
+        total_days = (end - start).days + 1
 
         detailed_calc.append({
-            'period': f"{start.strftime('%d.%m.%Y')} - {end.strftime('%d.%m.%Y')}",
+            'period': (
+                f"{start.strftime('%d.%m.%Y')} - "
+                f"{end.strftime('%d.%m.%Y')}"
+            ),
             'date_from': start.strftime('%d.%m.%Y'),
             'date_to': end.strftime('%d.%m.%Y'),
             'sum': base_sum,
-            'days': days,
+            'days': total_days,
             'rate': rate,
-            'interest': interest,
-            'formula': (
-                f"{base_sum:,.2f} × {days} × {rate}% / {year_days}"
-                .replace(',', ' ')
-            )
+            'interest': period_interest,
+            'formula': ' + '.join(formula_parts)
         })
 
-    return total_interest, detailed_calc
+    return round(total_interest, 2), detailed_calc
 
 
 def calculate_full_395(
@@ -553,21 +619,17 @@ def calculate_full_395(
             key_rates
         )
         if not split_periods:
-            split_periods = [(original_last['date_from'], today, original_last['rate'])]
+            split_periods = [
+                (original_last['date_from'], today, original_last['rate'])
+            ]
         for start, end, rate in split_periods:
             days = (end - start).days + 1
-            year_days = 366 if (
-                start.year % 4 == 0 and
-                start.year % 100 != 0 or
-                start.year % 400 == 0
-            ) else 365
             replacement_periods.append({
                 'sum': original_last['sum'],
                 'date_from': start,
                 'date_to': end,
                 'days': days,
                 'rate': rate,
-                'year_days': year_days,
             })
         periods = periods[:-1] + replacement_periods
 
@@ -576,32 +638,41 @@ def calculate_full_395(
     detailed_calc = []
 
     for p in periods:
-        year_days = p.get('year_days')
-        if not year_days:
-            year_days = 366 if (
-                p['date_from'].year % 4 == 0 and
-                p['date_from'].year % 100 != 0 or
-                p['date_from'].year % 400 == 0
-            ) else 365
+        start = p['date_from']
+        end = p['date_to']
+        rate = p['rate']
+        amount = p['sum']
 
-        interest = p['sum'] * p['days'] * p['rate'] / 100 / year_days
-        total_interest += interest
+        # Разбиваем период по годам для корректного расчёта
+        year_subperiods = _split_period_by_years(start, end)
+
+        period_interest = 0.0
+        formula_parts = []
+
+        for sub_start, sub_end, year_days in year_subperiods:
+            sub_days = (sub_end - sub_start).days + 1
+            sub_interest = amount * sub_days * rate / 100 / year_days
+            period_interest += sub_interest
+            formula_parts.append(
+                f"{amount:,.2f} × {sub_days} × {rate}% / {year_days}"
+                .replace(',', ' ')
+            )
+
+        period_interest = round(period_interest, 2)
+        total_interest += period_interest
 
         detailed_calc.append({
             'period': (
-                f"{p['date_from'].strftime('%d.%m.%Y')} - "
-                f"{p['date_to'].strftime('%d.%m.%Y')}"
+                f"{start.strftime('%d.%m.%Y')} - "
+                f"{end.strftime('%d.%m.%Y')}"
             ),
-            'date_from': p['date_from'].strftime('%d.%m.%Y'),
-            'date_to': p['date_to'].strftime('%d.%m.%Y'),
-            'sum': p['sum'],
+            'date_from': start.strftime('%d.%m.%Y'),
+            'date_to': end.strftime('%d.%m.%Y'),
+            'sum': amount,
             'days': p['days'],
-            'rate': p['rate'],
-            'interest': interest,
-            'formula': (
-                f"{p['sum']:,.2f} × {p['days']} × "
-                f"{p['rate']}% / {year_days}"
-            ).replace(',', ' ')
+            'rate': rate,
+            'interest': period_interest,
+            'formula': ' + '.join(formula_parts)
         })
 
     updated_table_rows = None
@@ -610,17 +681,22 @@ def calculate_full_395(
         and len(replacement_periods) == 1
         and table_rows
     ):
-        new_end = replacement_periods[0]['date_to']
-        new_days = replacement_periods[0]['days']
-        new_rate = replacement_periods[0]['rate']
-        new_interest = (
-            original_last['sum'] * new_days * new_rate / 100
-            / replacement_periods[0]['year_days']
+        rp = replacement_periods[0]
+        new_end = rp['date_to']
+        new_days = rp['days']
+        new_rate = rp['rate']
+        # Используем корректный расчёт с учётом границ года
+        new_interest = _calculate_interest_for_period(
+            original_last['sum'],
+            rp['date_from'],
+            new_end,
+            new_rate
         )
         total_days = sum(int(item.get('days', 0) or 0) for item in periods)
         if total_days > 0:
             avg_rate = sum(
-                float(item.get('rate', 0) or 0) * float(item.get('days', 0) or 0)
+                float(item.get('rate', 0) or 0)
+                * float(item.get('days', 0) or 0)
                 for item in periods
             ) / total_days
         else:
@@ -629,7 +705,7 @@ def calculate_full_395(
             table_rows,
             new_end,
             new_interest,
-            total_interest,
+            round(total_interest, 2),
             total_days,
             avg_rate,
             new_days,
@@ -637,7 +713,7 @@ def calculate_full_395(
         )
 
     return {
-        'total_interest': total_interest,
+        'total_interest': round(total_interest, 2),
         'detailed_calc': detailed_calc,
         'base_sum': base_sum,
         'periods_count': len(periods),
